@@ -1,0 +1,50 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+# Separate from cluster.yaml because eksctl refuses a cluster-create config
+# that contains managedNodeGroups when disableDefaultAddons is set. Applied
+# with `eksctl create nodegroup -f` after Cilium is installed.
+
+metadata:
+  name: amp-test
+  region: us-east-1
+  version: "1.34"
+  tags:
+    project: agent-manager-eval
+    owner: jhivan@wso2.com
+
+managedNodeGroups:
+  - name: ng-default
+    amiFamily: AmazonLinux2023
+    instanceType: c8i-flex.xlarge
+    desiredCapacity: 3
+    minSize: 3
+    maxSize: 5
+    volumeSize: 50
+    volumeType: gp3
+    volumeEncrypted: true
+    privateNetworking: true
+    # AL2023 nodeadm derives max-pods from the vpc-cni formula, which does not
+    # apply here. 110 sits under the ~117 addresses 4 ENIs x 30 IPs can hold.
+    maxPodsPerNode: 110
+    # Keeps every other pod off a node until cilium-agent is ready on it.
+    taints:
+      - key: node.cilium.io/agent-not-ready
+        value: "true"
+        effect: NoExecute
+    iam:
+      attachPolicyARNs:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      # cilium-operator uses the node instance profile to manage ENIs.
+      # AmazonEKS_CNI_Policy covers everything it needs except these two reads.
+      attachPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - ec2:DescribeVpcs
+              - ec2:DescribeSecurityGroups
+            Resource: "*"

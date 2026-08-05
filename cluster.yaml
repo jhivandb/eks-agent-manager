@@ -1,0 +1,38 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: amp-test
+  region: us-east-1
+  version: "1.34"
+  tags:
+    project: agent-manager-eval
+    owner: jhivan@wso2.com
+
+# Cilium provides both the CNI and the service proxy, so no AWS default addon
+# (vpc-cni, kube-proxy, coredns, metrics-server) is installed automatically.
+# coredns/metrics-server/ebs-csi come back explicitly via addons.yaml.
+addonsConfig:
+  disableDefaultAddons: true
+  autoApplyPodIdentityAssociations: true
+
+# c8i-flex.xlarge is not offered in us-east-1e, and eksctl picks AZs at random.
+availabilityZones:
+  - us-east-1a
+  - us-east-1b
+  - us-east-1c
+
+vpc:
+  cidr: 10.0.0.0/16
+  nat:
+    gateway: Single
+  clusterEndpoints:
+    publicAccess: true
+    privateAccess: true
+
+iam:
+  withOIDC: true
+
+# The nodegroup lives in nodegroup.yaml: with disableDefaultAddons (no VPC
+# CNI), eksctl refuses to create a cluster from any config that so much as
+# contains managedNodeGroups — even with --without-nodegroup.
