@@ -86,11 +86,15 @@ log "Step 2: Agent Manager on external PostgreSQL"
 # false the console publishes http:// and the browser blocks it as mixed content.
 # Both replicaCount and autoscaling.minReplicas are needed — the HPA is on by
 # default and would scale replicaCount straight back to 1.
+# --reuse-values so a re-run keeps values that later steps layer onto this
+# release (the gatewayMgmt hostnames wired at the end of this script) instead
+# of dropping them until that step re-applies them. No-op on first install.
 helm upgrade --install --server-side=false amp \
   "${CHART_BASE}/wso2-agent-manager" \
   --version "${VERSION}" \
   --namespace "${AMP_NS}" \
   --create-namespace \
+  --reuse-values \
   --set console.config.instrumentationUrl="${INSTRUMENTATION_URL}" \
   --set console.config.auth.baseUrl="${THUNDER_PUBLIC_URL}" \
   --set console.config.auth.signInRedirectURL="${CONSOLE_PUBLIC_URL}/login" \
@@ -149,10 +153,14 @@ log "Step 4: platform resources"
 # dies on an empty 'Failed to get access token:'.
 # apiPlatformGateway.namespace must match where Step 7 installs the gateway, or
 # agent traces and inbound routing both silently go to an unresolvable host.
+# --reuse-values so a re-run keeps values layered onto this release later: the
+# environment gateway hosts (end of this script) and the deployment-pipeline
+# promotion targets (07-add-environment.sh). No-op on first install.
 helm upgrade --install --server-side=false amp-platform-resources \
   "${CHART_BASE}/wso2-amp-platform-resources-extension" \
   --version "${VERSION}" \
   --namespace "${DEFAULT_NS}" \
+  --reuse-values \
   --set global.oauth.tokenUrl="${THUNDER_INTERNAL_URL}/oauth2/token" \
   --set global.oauth.hostHeader="amp-thunder-extension-service.${THUNDER_NS}.svc.cluster.local" \
   --set global.apiServer.url="${OPENCHOREO_API_URL}" \
@@ -214,8 +222,13 @@ else
     --timeout 1800s
 fi
 
-kubectl wait --for=condition=complete job/api-platform-default-default-bootstrap \
-  -n "${DATA_PLANE_NS}" --timeout=600s
+# The bootstrap Job only exists right after a fresh install — it is a helm
+# hook that gets cleaned up later, so on re-runs (install skipped above) there
+# is nothing to wait for.
+if kubectl get job api-platform-default-default-bootstrap -n "${DATA_PLANE_NS}" >/dev/null 2>&1; then
+  kubectl wait --for=condition=complete job/api-platform-default-default-bootstrap \
+    -n "${DATA_PLANE_NS}" --timeout=600s
+fi
 
 # ============================================================ Remaining endpoints
 
@@ -309,7 +322,9 @@ log "Verification"
 kubectl get apigateway api-platform-default-default -n "${DATA_PLANE_NS}" || true
 kubectl get pods -n "${AMP_NS}"
 
-for url in "${API_PUBLIC_URL}/health" "${OBS_API_PUBLIC_URL}/health" "${CONSOLE_PUBLIC_URL}/"; do
+# The API's health endpoint is /healthz (moved off /health in the 20260806
+# nightly); the observer still serves /health.
+for url in "${API_PUBLIC_URL}/healthz" "${OBS_API_PUBLIC_URL}/health" "${CONSOLE_PUBLIC_URL}/"; do
   printf '  %-60s %s\n' "$url" "$(curl -s -o /dev/null -w '%{http_code}' "$url" || echo unreachable)"
 done
 

@@ -1,11 +1,17 @@
 # Agent Manager on EKS
 
-Scripted install of WSO2 Agent Manager `0.0.0-dev-20260805` on a fresh EKS
-cluster, following `documentation/docs/getting-started/on-your-environment.mdx`
+Scripted install of WSO2 Agent Manager (the nightly pinned as `VERSION` in
+`env.sh` — nightlies delete the previous day's images, so this moves daily) on
+a fresh EKS cluster, following
+`documentation/docs/getting-started/on-your-environment.mdx`
 (the `next` docs) with production variants throughout.
 
 **Run these with `bash`, not fish.** The install uses heredocs and `export`
 semantics fish does not share.
+
+Every failure hit (or dodged) during the first install is written up in
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md) — symptom, root cause, and the fix
+now baked into the scripts.
 
 ## Order
 
@@ -17,6 +23,8 @@ semantics fish does not share.
 | `03-openchoreo.sh` | Phase 1: prereqs, OpenBao, TLS, Thunder, 4 planes, DNS | ~40 min |
 | `035-registry.sh` | Container registry at `registry.<base>` | ~5 min |
 | `04-agent-manager.sh` | Phase 2: Agent Manager, extensions, env-Thunder | ~30 min |
+| `05-access.sh {public\|vpn}` | Locks the public endpoints + EKS API to the VPN, or reopens them | ~5 min |
+| `07-add-environment.sh <name> "<Display>" [--production]` | New environment: split gateways, env-Thunder, pipeline wiring | ~15 min |
 | `99-teardown.sh [--keep-db] [--snapshot] [--yes]` | Destroys everything | ~25 min |
 
 `env.sh` holds all shared configuration and is sourced by the rest. It generates
@@ -82,6 +90,49 @@ Getting these wrong means uninstalling and discarding data, not a `helm upgrade`
 
 Discarding Thunder's data also recreates the organization, which orphans every
 organization-scoped row Agent Manager holds. Treat it as a platform-data reset.
+
+## Environments are provision-once
+
+`04` creates the `default` environment with a single BOTH-role gateway (the
+guide's shape). Further environments come from `07-add-environment.sh`, which
+provisions split INGRESS/EGRESS gateways, an env-Thunder, and adds the
+environment to the default deployment pipeline as a promotion target of
+`default`.
+
+There is no reshape-in-place: gateway role, vhost and hostname freeze at first
+registration, and the Agent Manager API refuses to deregister a gateway that
+has ever held deployment records — the check counts rows regardless of status,
+so even fully UNDEPLOYED/ARCHIVED test deployments block it permanently. Pick
+the topology at creation time. Env names cap at **8 characters** for org
+`default` in split topology (the generated egress gateway Service name hits
+Kubernetes' 63-char limit) — hence `prod`, not `production`.
+
+## Access modes
+
+`./05-access.sh vpn` restricts every internet-facing endpoint to WSO2's VPN
+egress CIDRs (read from `vpn.env`, gitignored — values come from WSO2 IT);
+`./05-access.sh public` reopens everything. Both are idempotent and safe to
+flip repeatedly.
+
+The internet-facing surface is **five** load balancers, not three: the plane
+gateways in the control, data and observability namespaces, plus the Thunder
+extension gateway (`:8443`, control plane) and the observability Prometheus —
+those last two are just as public as the gateways. The registry LB is internal
+and untouched. vpn mode also restricts the EKS API endpoint's
+`publicAccessCidrs`, always appending this machine's current public IP as a
+lockout guard.
+
+The mechanism is `spec.loadBalancerSourceRanges` patched straight onto the
+Services. kgateway (v2.2.1) does **not** revert the patch — verified through a
+forced Gateway reconcile and a full controller restart; its server-side apply
+never claims that field. The patch is only lost if a Service is deleted and
+recreated (chart reinstall) — re-run the script afterwards.
+
+**The NAT-EIP hairpin:** in-cluster components call the platform's *public*
+hostnames (Thunder token/JWKS, observer, agent trace export), so their traffic
+leaves through the VPC's NAT gateway and re-enters via the public LBs. vpn mode
+automatically appends the NAT gateway's Elastic IP(s) to the allowlist; without
+them the platform silently breaks itself while every pod looks healthy.
 
 ## Cost
 

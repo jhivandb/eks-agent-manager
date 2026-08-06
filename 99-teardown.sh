@@ -55,8 +55,18 @@ if cluster_reachable; then
   # Reverse install order; every one is optional because teardown must work
   # from a partially-installed cluster too.
   uninstall() { helm uninstall "$1" -n "$2" --ignore-not-found --wait --timeout 5m 2>/dev/null || warn "could not uninstall $1"; }
-  uninstall api-platform-default-default   "${DATA_PLANE_NS}"
-  uninstall amp-thunder-default-default    amp-thunder-default-default
+  # Per-environment gateway halves and env-Thunder releases, discovered
+  # dynamically (07-add-environment.sh creates a pair + one Thunder per env).
+  # Gateway releases must go while the gateway-operator is still running, or
+  # their APIGateway finalizers hang the namespace deletion below. The
+  # operator-generated *-gw child releases are skipped: uninstalling the
+  # parent tears them down.
+  helm list -A -o json 2>/dev/null \
+    | jq -r '.[] | select(
+        ((.name | startswith("api-platform-")) and (.name | endswith("-gw") | not)) or
+        ((.name | startswith("amp-thunder-")) and .name != "amp-thunder-extension")
+      ) | "\(.name) \(.namespace)"' \
+    | while read -r rel ns; do uninstall "$rel" "$ns"; done
   uninstall amp-evaluation-extension       "${BUILD_CI_NS}"
   uninstall amp-observability-traces        "${OBSERVABILITY_NS}"
   uninstall amp-platform-resources          "${DEFAULT_NS}"
@@ -86,10 +96,19 @@ if cluster_reachable; then
       done
 
   log "Deleting namespaces (this releases the EBS volumes behind every PVC)"
+  # Per-environment namespaces are discovered, not hardcoded: gateway halves
+  # carry the label 07-add-environment.sh stamps; env-Thunder namespaces are
+  # amp-thunder-<org>-<env>. Each holds a PVC that would otherwise orphan an
+  # EBS volume.
+  ENV_NS="$( { kubectl get ns -l amp.wso2.com/api-platform-gateway=true -o name 2>/dev/null;
+               kubectl get ns -o name 2>/dev/null | grep '/amp-thunder-'; } \
+             | sed 's|namespace/||' | sort -u | tr '\n' ' ')"
+  # shellcheck disable=SC2086  # ENV_NS is a space-separated namespace list
   kubectl delete namespace \
-    "${AMP_NS}" "${THUNDER_NS}" amp-thunder-default-default \
+    "${AMP_NS}" "${THUNDER_NS}" \
     "${OBSERVABILITY_NS}" "${BUILD_CI_NS}" "${DATA_PLANE_NS}" "${CONTROL_PLANE_NS}" \
     "${REGISTRY_NS}" openbao external-secrets cert-manager agent-sandbox-system \
+    ${ENV_NS} \
     --ignore-not-found --timeout=10m || warn "some namespaces did not finish deleting"
 
   log "Waiting for load balancers to disappear from the VPC"

@@ -1,3 +1,4 @@
 .secrets/
 domain.env
 contact.json
+vpn.env

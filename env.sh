@@ -36,7 +36,7 @@ export THUNDER_DBS="configdb runtimedb userdb"
 # amp/v${VERSION} — the install pulls values files from raw.githubusercontent at
 # that tag. The literal "0.0.0-dev" in the docs is a local-build placeholder and
 # is published under neither.
-export VERSION="0.0.0-dev-20260805"
+export VERSION="0.0.0-dev-20260806"
 export HELM_CHART_REGISTRY="ghcr.io/wso2"
 
 # ---------------------------------------------------------------- Hostnames
@@ -155,6 +155,19 @@ require_placeholders_filled() {
   # Explicit success: under set -e, a function whose last statement is a false
   # `(( )) && die` returns 1 and silently kills the calling script.
   return 0
+}
+
+# Client-credentials token from platform Thunder for the Agent Manager API.
+# Thunder only grants scopes that are explicitly requested, so callers must
+# pass everything they need (e.g. "amp:gateway:read amp:gateway:delete").
+am_token() {
+  local scopes="$1" token
+  token="$(curl -sf -X POST "${THUNDER_PUBLIC_URL}/oauth2/token" \
+    -u "amp-api-client:${AMP_API_CLIENT_SECRET}" \
+    --data-urlencode "grant_type=client_credentials" \
+    --data-urlencode "scope=${scopes}" | jq -r '.access_token // empty')"
+  [[ -n "$token" ]] || die "could not obtain an Agent Manager token from ${THUNDER_PUBLIC_URL}"
+  echo "$token"
 }
 
 # Upserts one Route 53 record. EKS gateways return ELB hostnames, so these are
