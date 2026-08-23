@@ -45,6 +45,24 @@ cluster_reachable() {
     && kubectl cluster-info >/dev/null 2>&1
 }
 
+# Cilium runs in ENI IPAM mode here (cilium-values.yaml), so it attaches its own
+# ENIs to every node rather than sharing the node's. Those do not always release
+# when the instance terminates, and a single leftover ENI makes the VPC delete
+# fail with a DependencyViolation that names nothing useful.
+sweep_available_enis() {
+  local vpc="$1" ids eni
+  [[ -n "$vpc" && "$vpc" != "None" ]] || return 0
+  ids="$(aws ec2 describe-network-interfaces --region "${AWS_REGION}" \
+    --filters "Name=vpc-id,Values=${vpc}" "Name=status,Values=available" \
+    --query 'NetworkInterfaces[].NetworkInterfaceId' --output text 2>/dev/null || true)"
+  [[ -n "$ids" ]] || return 0
+  for eni in $ids; do
+    echo "  deleting detached ENI ${eni}"
+    aws ec2 delete-network-interface --network-interface-id "$eni" --region "${AWS_REGION}" 2>/dev/null \
+      || warn "could not delete ${eni}"
+  done
+}
+
 if cluster_reachable; then
   log "Deleting plane registrations"
   kubectl delete clusterdataplane default -n default --ignore-not-found
@@ -111,6 +129,19 @@ if cluster_reachable; then
     ${ENV_NS} \
     --ignore-not-found --timeout=10m || warn "some namespaces did not finish deleting"
 
+  log "Sweeping any PVC left outside those namespaces"
+  # The list above is namespace-driven, so it misses claims in namespaces
+  # OpenChoreo creates on its own (dp-*, workflows-*). Deleting the claim while
+  # the cluster still runs is the only thing that makes the CSI driver call
+  # DeleteVolume; after the cluster is gone the volume is ours to find by hand.
+  kubectl get pvc -A -o json 2>/dev/null \
+    | jq -r '.items[] | "\(.metadata.namespace) \(.metadata.name)"' \
+    | while read -r ns name; do
+        [[ -n "$ns" ]] || continue
+        kubectl delete pvc "$name" -n "$ns" --ignore-not-found --timeout=3m \
+          || warn "PVC ${ns}/${name} did not delete — its volume may orphan"
+      done
+
   log "Waiting for load balancers to disappear from the VPC"
   VPC_ID="$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" \
     --query 'cluster.resourcesVpcConfig.vpcId' --output text 2>/dev/null || true)"
@@ -152,9 +183,11 @@ if ! $KEEP_DB; then
     log "Deleting RDS instance ${DB_INSTANCE_ID}"
     if $FINAL_SNAPSHOT; then
       snap="${DB_INSTANCE_ID}-final-$(aws sts get-caller-identity --query Account --output text)-$RANDOM"
+      # The final snapshot is the one we keep; the rolling automated backups are
+      # not, and they go on billing after the instance is gone unless said so.
       aws rds delete-db-instance --region "${AWS_REGION}" \
         --db-instance-identifier "${DB_INSTANCE_ID}" \
-        --final-db-snapshot-identifier "${snap}" >/dev/null
+        --final-db-snapshot-identifier "${snap}" --delete-automated-backups >/dev/null
       echo "  final snapshot: ${snap}"
     else
       aws rds delete-db-instance --region "${AWS_REGION}" \
@@ -175,18 +208,55 @@ if ! $KEEP_DB; then
     SG_ID="$(aws ec2 describe-security-groups --region "${AWS_REGION}" \
       --filters "Name=vpc-id,Values=${VPC_ID}" "Name=group-name,Values=${CLUSTER_NAME}-db-sg" \
       --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo None)"
-    [[ "${SG_ID}" != "None" && -n "${SG_ID}" ]] && \
-      aws ec2 delete-security-group --group-id "${SG_ID}" --region "${AWS_REGION}" 2>/dev/null \
-      || true
+    if [[ "${SG_ID}" != "None" && -n "${SG_ID}" ]]; then
+      log "Deleting the RDS security group ${SG_ID}"
+      # RDS holds its ENI for a few minutes after the instance reports deleted,
+      # and the group cannot go while that ENI references it. Retry rather than
+      # swallow: the only other symptom is eksctl failing on the VPC later with
+      # no hint that a security group is what is holding it.
+      for attempt in $(seq 1 15); do
+        if sg_err="$(aws ec2 delete-security-group --group-id "${SG_ID}" \
+                       --region "${AWS_REGION}" 2>&1)"; then
+          SG_ID=""
+          break
+        fi
+        echo "  attempt ${attempt}/15: ${sg_err##*: }"
+        sleep 20
+      done
+      if [[ -n "${SG_ID}" ]]; then
+        warn "could not delete ${SG_ID} — eksctl will fail to delete the VPC until it goes"
+      fi
+    fi
   fi
 else
   warn "Keeping RDS instance ${DB_INSTANCE_ID}. Its security group blocks VPC deletion,"
   warn "so eksctl will fail below — move the instance to another VPC or drop --keep-db."
 fi
 
-log "Deleting the EKS cluster (~15 min)"
-eksctl delete cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --disable-nodegroup-eviction --wait \
-  || warn "eksctl reported errors — check for leftovers below"
+log "Deleting the nodegroups first (~5 min)"
+# Deleting the nodes as a separate step buys a window in which the instances are
+# gone but the VPC is not, which is the only moment Cilium's leftover ENIs can be
+# swept. Doing it inside `eksctl delete cluster` gives no such window: the VPC
+# delete follows immediately and fails on them.
+NODEGROUPS="$(aws eks list-nodegroups --cluster-name "${CLUSTER_NAME}" --region "${AWS_REGION}" \
+  --query 'nodegroups[]' --output text 2>/dev/null || true)"
+for ng in ${NODEGROUPS}; do
+  eksctl delete nodegroup --cluster "${CLUSTER_NAME}" --name "${ng}" --region "${AWS_REGION}" \
+    --disable-eviction --wait || warn "could not cleanly delete nodegroup ${ng}"
+done
+
+log "Sweeping ENIs the nodes left behind"
+sweep_available_enis "${VPC_ID}"
+
+log "Deleting the EKS cluster (~10 min)"
+if ! eksctl delete cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" \
+       --disable-nodegroup-eviction --wait; then
+  warn "eksctl failed — sweeping ENIs once more and retrying"
+  sweep_available_enis "${VPC_ID}"
+  eksctl delete cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" \
+    --disable-nodegroup-eviction --wait \
+    || warn "eksctl reported errors again — check for leftovers below"
+fi
 
 log "Deleting the cert-manager Route 53 IAM policy"
 # eksctl removes the IRSA role with the cluster, but not this customer-managed
@@ -202,18 +272,60 @@ if aws iam get-policy --policy-arn "${POLICY_ARN}" >/dev/null 2>&1; then
     || warn "could not delete ${POLICY_ARN} — it may still be attached"
 fi
 
-log "Checking for orphaned resources you would otherwise keep paying for"
-if [[ -n "${VPC_ID}" && "${VPC_ID}" != "None" ]]; then
-  echo "Available ENIs in ${VPC_ID} (Cilium allocates these; they should be gone):"
-  aws ec2 describe-network-interfaces --region "${AWS_REGION}" \
-    --filters "Name=vpc-id,Values=${VPC_ID}" "Name=status,Values=available" \
-    --query 'NetworkInterfaces[].NetworkInterfaceId' --output text || true
-fi
-echo "Unattached EBS volumes tagged for this cluster:"
-aws ec2 describe-volumes --region "${AWS_REGION}" \
+log "Clearing anything the teardown left billable"
+# Everything below bills by the hour whether or not the cluster still exists, so
+# these are deleted, not merely listed. Only the last two checks are reports:
+# a surviving VPC or stack means something above failed and wants a human.
+
+echo "EBS volumes tagged for this cluster and no longer attached:"
+for vol in $(aws ec2 describe-volumes --region "${AWS_REGION}" \
   --filters "Name=status,Values=available" \
             "Name=tag:kubernetes.io/cluster/${CLUSTER_NAME},Values=owned" \
-  --query 'Volumes[].{Id:VolumeId,GiB:Size}' --output table 2>/dev/null || true
+  --query 'Volumes[].VolumeId' --output text 2>/dev/null || true); do
+  echo "  deleting ${vol}"
+  aws ec2 delete-volume --volume-id "${vol}" --region "${AWS_REGION}" 2>/dev/null \
+    || warn "could not delete ${vol}"
+done
+
+echo "Elastic IPs left unassociated (the NAT gateway's, if its stack half-failed):"
+for alloc in $(aws ec2 describe-addresses --region "${AWS_REGION}" \
+  --query 'Addresses[?AssociationId==null].AllocationId' --output text 2>/dev/null || true); do
+  echo "  releasing ${alloc}"
+  aws ec2 release-address --allocation-id "${alloc}" --region "${AWS_REGION}" 2>/dev/null \
+    || warn "could not release ${alloc}"
+done
+
+if [[ -n "${VPC_ID}" && "${VPC_ID}" != "None" ]]; then
+  echo "Detached ENIs still in ${VPC_ID}:"
+  sweep_available_enis "${VPC_ID}"
+
+  echo "Load balancers still in ${VPC_ID} (these hold the VPC open):"
+  aws elb describe-load-balancers --region "${AWS_REGION}" \
+    --query "LoadBalancerDescriptions[?VPCId=='${VPC_ID}'].LoadBalancerName" --output text 2>/dev/null || true
+  aws elbv2 describe-load-balancers --region "${AWS_REGION}" \
+    --query "LoadBalancers[?VpcId=='${VPC_ID}'].LoadBalancerName" --output text 2>/dev/null || true
+
+  echo "Non-default security groups still in ${VPC_ID}:"
+  aws ec2 describe-security-groups --region "${AWS_REGION}" \
+    --filters "Name=vpc-id,Values=${VPC_ID}" \
+    --query "SecurityGroups[?GroupName!='default'].GroupName" --output text 2>/dev/null || true
+
+  echo "The VPC itself (empty output means it is gone, which is what you want):"
+  aws ec2 describe-vpcs --vpc-ids "${VPC_ID}" --region "${AWS_REGION}" \
+    --query 'Vpcs[].VpcId' --output text 2>/dev/null || true
+fi
+
+echo "IAM OIDC providers left for this cluster:"
+for arn in $(aws iam list-open-id-connect-providers \
+  --query 'OpenIDConnectProviderList[].Arn' --output text 2>/dev/null || true); do
+  if aws iam get-open-id-connect-provider --open-id-connect-provider-arn "${arn}" \
+       --query 'ClientIDList' --output text >/dev/null 2>&1; then
+    # eksctl removes the cluster's provider with the cluster; one surviving here
+    # is either a leftover or another cluster's, so report and let a human judge.
+    echo "  ${arn}"
+  fi
+done
+
 echo "Any remaining CloudFormation stacks:"
 aws cloudformation describe-stacks --region "${AWS_REGION}" \
   --query "Stacks[?contains(StackName,'${CLUSTER_NAME}')].{Name:StackName,Status:StackStatus}" \

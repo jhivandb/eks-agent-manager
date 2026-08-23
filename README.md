@@ -1,8 +1,7 @@
 # Agent Manager on EKS
 
-Scripted install of WSO2 Agent Manager (the nightly pinned as `VERSION` in
-`env.sh` — nightlies delete the previous day's images, so this moves daily) on
-a fresh EKS cluster, following
+Scripted install of WSO2 Agent Manager (the release pinned as `VERSION` in
+`env.sh`, currently `1.0.0-rc1`) on a fresh EKS cluster, following
 `documentation/docs/getting-started/on-your-environment.mdx`
 (the `next` docs) with production variants throughout.
 
@@ -19,7 +18,7 @@ now baked into the scripts.
 |---|---|---|
 | `00-domain.sh {check\|register\|adopt} <domain>` | Route 53 hosted zone; writes `domain.env` | ~10 min |
 | `01-cluster.sh` | EKS 1.34, Cilium, addons, gp3 default StorageClass | ~25 min |
-| `02-rds.sh` | RDS PostgreSQL 17.10, 4 databases, Thunder's schema | ~15 min |
+| `02-rds.sh` | RDS PostgreSQL 17.10, 5 databases, Thunder's schema | ~15 min |
 | `03-openchoreo.sh` | Phase 1: prereqs, OpenBao, TLS, Thunder, 4 planes, DNS | ~40 min |
 | `035-registry.sh` | Container registry at `registry.<base>` | ~5 min |
 | `04-agent-manager.sh` | Phase 2: Agent Manager, extensions, env-Thunder | ~30 min |
@@ -30,13 +29,28 @@ now baked into the scripts.
 `env.sh` holds all shared configuration and is sourced by the rest. It generates
 `.secrets/platform-secrets.env` once and reuses it forever — Thunder seeds those
 values into its database on first boot and never re-seeds, so regenerating them
-would silently desynchronise Thunder from every consumer.
+would silently desynchronise Thunder from every consumer. It generates
+`.secrets/thunder-handles.env` on the same terms, one handle per environment.
+
+## DNS
+
+`03` publishes a **`*.<BASE_DOMAIN>` wildcard**, and it is required rather than
+one of two possible layouts: each environment's Thunder gets a hostname of
+`<handle>.<BASE_DOMAIN>`, minted when the environment is provisioned, so those
+names cannot be published up front. `console`, `api-amp`, `thunder` and `cp`
+keep explicit records documenting intent; `traces` and `agents` (plus
+`*.agents`) keep theirs and still win, because an exact name beats a wildcard.
+The control-plane certificate covers `*.<BASE_DOMAIN>` and the apex — the extra
+`*.thunder.<BASE_DOMAIN>` name earlier versions carried is gone along with the
+nested hostname shape that needed it.
 
 ## Cluster shape
 
-3 × `c8i-flex.xlarge` (4 vCPU / 8 GiB), 50 GB gp3 each, private subnets behind a
-single NAT gateway, AZs pinned to `us-east-1a/b/c` because `c8i-flex` is not
-offered in `us-east-1e` and eksctl picks AZs at random.
+3 × `c8i-flex.2xlarge` (8 vCPU / 16 GiB), 50 GB gp3 each, private subnets behind
+a single NAT gateway, AZs pinned to `us-east-1a/b/c` because the flex instance
+families are not offered in every `us-east-1` zone and eksctl picks AZs at
+random. A managed nodegroup's `instanceType` is immutable, so changing it means
+a new nodegroup, not an edit.
 
 Cilium replaces both the CNI and kube-proxy (`disableDefaultAddons: true`), in
 ENI IPAM mode with native routing, so pods hold real VPC addresses. It must be
@@ -72,6 +86,13 @@ are the only way back in — move them into a real secret manager.
 
 **OpenSearch volume is 50Gi, not 100Gi.** `OPENSEARCH_PV_SIZE` in `env.sh`.
 
+**`amp-api` runs a single replica.** The chart's `gatewayManifestCache` defaults
+to an in-process `memory` cache, which is only safe at one replica: each replica
+observes just the manifest pushes routed to it, so two of them end up
+disagreeing about which policies the gateways report. `04` sets both
+`replicaCount` and `autoscaling.minReplicas` to 1. The console and the observer
+stay at 2 — neither holds shared state. A Redis backend is what lifts this.
+
 **Let's Encrypt production, not staging.** env-Thunder provisioning runs with
 `SKIP_CA_BUNDLE_TRUST=true`, which requires publicly trusted certificates. The
 rate limit that bites is 5 *duplicate* certs per week; the four issued here are
@@ -83,6 +104,14 @@ Getting these wrong means uninstalling and discarding data, not a `helm upgrade`
 
 - Thunder's database, its six platform client secrets, `THUNDER_PUBLIC_URL`,
   `CONSOLE_PUBLIC_URL`, and the MCP resource identifiers
+- The platform console's admin password. The chart generates it and writes it to
+  Secret `amp-admin-credentials`; `03` copies it to
+  `.secrets/console-admin-password.txt`. There is no documented `admin`/`admin`
+  any more, and nothing re-generates it on a later upgrade.
+- Each environment's Thunder **handle**, kept in `.secrets/thunder-handles.env`.
+  The handle is the hostname label and Thunder mints its issuer from it, so a
+  second handle for the same environment reads as a different, unprovisioned
+  one. Upstream removed the grandfathering that used to paper over this.
 - Agent Manager's database
 - `gateway.vhost` / `gateway.hostname` on the gateway extension — written at
   first registration only, and later runs log `already exists` and reconcile
@@ -93,11 +122,21 @@ organization-scoped row Agent Manager holds. Treat it as a platform-data reset.
 
 ## Environments are provision-once
 
-`04` creates the `default` environment with a single BOTH-role gateway (the
-guide's shape). Further environments come from `07-add-environment.sh`, which
-provisions split INGRESS/EGRESS gateways, an env-Thunder, and adds the
-environment to the default deployment pipeline as a promotion target of
-`default`.
+`04` creates the `default` environment with **split INGRESS/EGRESS gateways**
+(`default-default` and `default-default-egress`), deviating from the guide's
+single BOTH-role gateway so that every environment on this install has the same
+shape. Further environments come from `07-add-environment.sh`, which provisions
+the same split pair, an env-Thunder, and adds the environment to the default
+deployment pipeline as a promotion target of `default`.
+
+Both halves route behind the data plane's existing `gateway-default` load
+balancer: the gateway extension chart emits an HTTPRoute plus a ReferenceGrant
+whenever `apiGateway.namespace` differs from `kgateway.namespace`, so the split
+needs no extra DNS record, certificate or load balancer. `04` leaves
+`apiPlatformGateway.namespace` **empty** on purpose — the chart then derives each
+environment's gateway runtime host from per-component trait placeholders, which
+is what keeps agent traces from later environments off `default`'s gateway
+(TROUBLESHOOTING §21).
 
 There is no reshape-in-place: gateway role, vhost and hostname freeze at first
 registration, and the Agent Manager API refuses to deregister a gateway that
@@ -114,11 +153,14 @@ egress CIDRs (read from `vpn.env`, gitignored — values come from WSO2 IT);
 `./05-access.sh public` reopens everything. Both are idempotent and safe to
 flip repeatedly.
 
-The internet-facing surface is **five** load balancers, not three: the plane
-gateways in the control, data and observability namespaces, plus the Thunder
-extension gateway (`:8443`, control plane) and the observability Prometheus —
-those last two are just as public as the gateways. The registry LB is internal
-and untouched. vpn mode also restricts the EKS API endpoint's
+The internet-facing surface is **four** load balancers, not three: the plane
+gateways in the control, data and observability namespaces, plus the
+observability Prometheus, which is just as public as they are. The registry LB
+is internal and untouched. It was five before rc1 — `03` now installs Thunder
+with `ocIngress.https.enabled=false`, dropping the dedicated `:8443` Thunder
+Gateway, which was k3d scaffolding here: the same HTTPRoute also attaches to the
+control plane's `gateway-default` on 443 with the real wildcard certificate.
+`05-access.sh` still lists that target and skips it when it is absent. vpn mode also restricts the EKS API endpoint's
 `publicAccessCidrs`, always appending this machine's current public IP as a
 lockout guard.
 
@@ -136,9 +178,13 @@ them the platform silently breaks itself while every pod looks healthy.
 
 ## Cost
 
-Roughly **$0.85–1.00/hr** with everything running: 3 nodes, EKS control plane,
-single NAT gateway, RDS `db.t4g.small`, and four load balancers (three plane
-gateways plus the internal registry). Tear it down between sessions.
+Roughly **$1.25–1.45/hr** with everything running: 3 × `c8i-flex.2xlarge`, EKS
+control plane, single NAT gateway, RDS `db.t4g.small`, and four load balancers
+(three plane gateways plus the internal registry). The nodes are the part that
+moved — `c8i-flex.2xlarge` is twice the vCPU of the `m8i-flex.xlarge` this
+replaced, and roughly twice the hourly rate, so the node line is about $0.35/hr
+higher in total. Confirm the current on-demand rate for your region before
+budgeting; it is the largest single line here. Tear it down between sessions.
 
 ## Re-running
 

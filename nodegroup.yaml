@@ -16,7 +16,10 @@ metadata:
 managedNodeGroups:
   - name: ng-default
     amiFamily: AmazonLinux2023
-    instanceType: c8i-flex.xlarge
+    # 8 vCPU / 16 GiB. The 4-vCPU m8i-flex.xlarge this replaced held the same
+    # 16 GiB but left the platform CPU-bound; a managed nodegroup's instanceType
+    # is immutable, so the change arrives as a new nodegroup.
+    instanceType: c8i-flex.2xlarge
     desiredCapacity: 3
     minSize: 3
     maxSize: 5
@@ -25,7 +28,16 @@ managedNodeGroups:
     volumeEncrypted: true
     privateNetworking: true
     # AL2023 nodeadm derives max-pods from the vpc-cni formula, which does not
-    # apply here. 110 sits under the ~117 addresses 4 ENIs x 30 IPs can hold.
+    # apply here. Cilium runs ENI IPAM with native routing, so every pod holds a
+    # real VPC address and this ceiling is a hard one — overcommitting strands
+    # pods Unschedulable with nothing naming the cause.
+    #
+    # c8i-flex.2xlarge reports 4 network interfaces at 30 IPv4 each. One address
+    # per ENI is the interface's own, leaving 4 x 29 = 116 assignable to pods, so
+    # 110 keeps headroom. Same budget as the m8i-flex.xlarge this replaced — the
+    # extra vCPU does not buy more addresses, so the pod ceiling did not move.
+    # Re-derive with `aws ec2 describe-instance-types --instance-types <type>
+    # --query 'InstanceTypes[].NetworkInfo'` before changing instanceType.
     maxPodsPerNode: 110
     # Keeps every other pod off a node until cilium-agent is ready on it.
     taints:

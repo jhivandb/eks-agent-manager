@@ -16,7 +16,12 @@ addonsConfig:
   disableDefaultAddons: true
   autoApplyPodIdentityAssociations: true
 
-# c8i-flex.xlarge is not offered in us-east-1e, and eksctl picks AZs at random.
+# eksctl picks AZs at random, and the flex instance families are not offered in
+# every us-east-1 zone: c8i-flex.2xlarge is offered in 1a/1b/1c/1d/1f but not in
+# 1e, the same gap m8i-flex had. Pinned to three of the zones that do offer it.
+# Re-check with `aws ec2 describe-instance-type-offerings --location-type
+# availability-zone --filters Name=instance-type,Values=<type>` before changing
+# the nodegroup's instanceType.
 availabilityZones:
   - us-east-1a
   - us-east-1b

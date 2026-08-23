@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Creates the RDS PostgreSQL instance and the four databases the platform needs:
-# agentmanager (Agent Manager) and configdb/runtimedb/userdb (Thunder).
+# Creates the RDS PostgreSQL instance and the five databases the platform needs:
+# agentmanager (Agent Manager) and Thunder's four (see THUNDER_DBS in env.sh).
 #
 # The instance is private to the cluster VPC, so every psql call runs from a
 # throwaway pod inside the cluster rather than from this machine. Thunder's
@@ -12,11 +12,30 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env.sh"
 command -v docker >/dev/null || die "docker is needed to extract Thunder's schema files"
 kubeconfig_points_at_cluster
 
-THUNDER_IMAGE="ghcr.io/thunder-id/thunderid:0.45.0"
+# Must match the image the chart runs: the schema loaded here and the binary that
+# reads it are versioned together. Loading 0.45.0's schema under a 1.0.0-beta
+# chart fails the pre-install hook with `relation "SERVER_CONFIG" does not exist`,
+# which reads like a connectivity fault rather than a version skew. Verified
+# against the chart below rather than trusted, because the tag moves with VERSION.
+THUNDER_IMAGE="ghcr.io/thunder-id/thunderid:1.0.0"
 PG_CLIENT_IMAGE="public.ecr.aws/docker/library/postgres:17"
 PARAM_GROUP="${CLUSTER_NAME}-pg17"
 SUBNET_GROUP="${CLUSTER_NAME}-db"
 SG_NAME="${CLUSTER_NAME}-db-sg"
+
+# Fail here, before anything is provisioned, rather than 40 minutes later inside
+# a Helm pre-install hook whose pod the job controller deletes on failure.
+CHART_THUNDER_TAG="$(helm show values \
+  "oci://${HELM_CHART_REGISTRY}/wso2-amp-thunder-extension" --version "${VERSION}" 2>/dev/null \
+  | awk '/^ *registry: *ghcr.io\/thunder-id *$/{f=1} f && /^ *tag:/{gsub(/["[:space:]]/,"",$2); print $2; exit}')"
+[[ -n "${CHART_THUNDER_TAG}" ]] \
+  || die "Could not read thunder's image tag from wso2-amp-thunder-extension ${VERSION}."
+[[ "${THUNDER_IMAGE##*:}" == "${CHART_THUNDER_TAG}" ]] \
+  || die "THUNDER_IMAGE is pinned to ${THUNDER_IMAGE##*:} but chart ${VERSION} runs ${CHART_THUNDER_TAG}.
+  The schema this script loads must come from the image the chart runs. Set
+  THUNDER_IMAGE to ghcr.io/thunder-id/thunderid:${CHART_THUNDER_TAG}, confirm
+  THUNDER_DBS in env.sh still matches that image's dbscripts/ directories, and
+  check the datasource map in 03-openchoreo.sh."
 
 log "Locating the cluster VPC and its private subnets"
 VPC_ID="$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" \
@@ -146,7 +165,7 @@ create_db_if_absent() {
 create_db_if_absent "${AMP_DB_NAME}" "${AMP_DB_USER}"
 for db in ${THUNDER_DBS}; do create_db_if_absent "${db}" "${THUNDER_DB_USER}"; done
 
-log "Loading Thunder's schema into each of its three databases"
+log "Loading Thunder's schema into each of its four databases"
 # The chart's init container only initialises the bundled SQLite files. Against
 # an empty PostgreSQL the pre-install hook fails with a misleading timeout.
 for db in ${THUNDER_DBS}; do
@@ -156,12 +175,30 @@ for db in ${THUNDER_DBS}; do
     -v ON_ERROR_STOP=1 -q -f "/tmp/thunder-${db}.sql"
 done
 
-log "Table counts — expected: configdb 17, runtimedb 8, userdb 5"
+log "Asserting the loaded table counts"
+# Asserted, not just printed: an empty or partly loaded database does not fail
+# anything here. It fails Thunder's pre-install hook minutes later in 03, with
+# `Server failed to start within 60 seconds`, on a pod the job controller has
+# already deleted. Counts are the ones rc1's guide states, keyed by database
+# name rather than by position in THUNDER_DBS.
+declare -A EXPECTED_TABLES=(
+  [configdb]=20
+  [entitydb]=5
+  [runtime_persistent]=7
+  [runtime_transient]=13
+)
 for db in ${THUNDER_DBS}; do
+  expected="${EXPECTED_TABLES[$db]:-}"
+  [[ -n "${expected}" ]] \
+    || die "no expected table count for '${db}' — THUNDER_DBS changed, so update EXPECTED_TABLES here."
   count="$(kubectl exec -i pgclient -- env PGPASSWORD="${THUNDER_DB_PASSWORD}" \
     psql "postgresql://${THUNDER_DB_USER}@${DB_HOST}:5432/${db}?sslmode=require" \
     -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")"
-  printf '  %-12s %s\n' "${db}:" "${count}"
+  printf '  %-20s %s (expected %s)\n' "${db}:" "${count}" "${expected}"
+  [[ "${count}" == "${expected}" ]] \
+    || die "${db} loaded ${count} tables, expected ${expected}. The schema in
+  ${THUNDER_IMAGE} did not apply cleanly — re-run with the psql output visible
+  (drop -q from the load loop above) rather than continuing to 03."
 done
 
 kubectl delete pod pgclient --wait=false

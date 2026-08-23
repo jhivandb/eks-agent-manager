@@ -91,11 +91,30 @@ for i in $(seq 1 60); do
   sleep 5
 done
 
-if [[ -s "${BAO_INIT_FILE}" ]]; then
+# Ask OpenBao whether it is initialised rather than inferring it from the file.
+# The file is not evidence: 99-teardown.sh deliberately leaves .secrets/ in
+# place, so a keyfile from a destroyed cluster outlives it and a non-empty
+# `[[ -s ]]` check reads as "already initialised" on a brand-new instance —
+# which then fails the unseal with "Vault is not initialized".
+bao_initialized="$(kubectl exec -n openbao openbao-0 -- \
+  sh -c 'BAO_ADDR=http://127.0.0.1:8200 bao status -format=json 2>/dev/null || true' \
+  | jq -r '.initialized // "false"')"
+
+if [[ "${bao_initialized}" == "true" ]]; then
+  [[ -s "${BAO_INIT_FILE}" ]] || die "OpenBao is initialised but ${BAO_INIT_FILE} is missing or empty. Its unseal keys are the only way into that PVC — recover the file; do NOT re-initialise."
   warn "OpenBao already initialised — reusing keys from ${BAO_INIT_FILE}"
 else
   log "Step 2: initialising OpenBao"
   umask 077
+  # Initialized:false means no keys have ever existed here, so anything at this
+  # path belongs to a previous cluster. Archived rather than deleted: it is
+  # still key material, just for a PVC that no longer exists.
+  if [[ -s "${BAO_INIT_FILE}" ]]; then
+    stale_keys="${BAO_INIT_FILE}.stale-$(date +%Y%m%d%H%M%S)"
+    mv "${BAO_INIT_FILE}" "${stale_keys}"
+    warn "OpenBao is uninitialised but ${BAO_INIT_FILE} existed — keys from an earlier cluster."
+    warn "Archived to ${stale_keys}; initialising fresh."
+  fi
   rm -f "${BAO_INIT_FILE}"
   # Init writes to a temp file first: `> file` truncates before exec starts,
   # so a failed exec would leave a zero-byte file that a later run would
@@ -243,7 +262,15 @@ THUNDER_VALUES="${SECRETS_DIR}/thunder-db-values.yaml"
   echo "thunder:"
   echo "  configuration:"
   echo "    database:"
-  for pair in "config:configdb" "runtime:runtimedb" "user:userdb"; do
+  # Datasource key -> database name. Every key the chart declares must appear
+  # here: an unrecognised key is dropped without warning, and one that is simply
+  # absent keeps the chart default of SQLite on a PVC. Both are silent, so a
+  # stale map does not fail the install — it strands Thunder's state on one
+  # pod's disk while the release reports healthy. Keys come from
+  # charts/thunderid/templates/secret.yaml; the databases are THUNDER_DBS.
+  for pair in "config:configdb" "entity:entitydb" \
+              "runtime_persistent:runtime_persistent" \
+              "runtime_transient:runtime_transient"; do
     key="${pair%%:*}"; db="${pair##*:}"
     cat <<EOF
       ${key}:
@@ -268,12 +295,19 @@ else
   # All six bootstrap client secrets must be passed. Any omitted one keeps the
   # chart's shipped default while its consumer reads the generated value from
   # OpenBao, and builds then fail with an unlogged 401 invalid_client.
+  #
+  # ocIngress.https.enabled defaults to true, which stands up a second dedicated
+  # Gateway and a self-signed "AMP Local Dev CA" certificate so that a k3d
+  # install can reach Thunder over HTTPS without the control plane's gateway TLS.
+  # Every plane here already has its own LoadBalancer and a real wildcard
+  # certificate, so that Gateway and CA would only be an unused load balancer.
   helm install --server-side=false amp-thunder-extension \
     "oci://${HELM_CHART_REGISTRY}/wso2-amp-thunder-extension" \
     --version "${VERSION}" \
     --namespace "${THUNDER_NS}" \
     --create-namespace \
     --set thunder.ocIngress.hostname="${THUNDER_PUBLIC_HOST}" \
+    --set thunder.ocIngress.https.enabled=false \
     --set thunder.configuration.server.publicUrl="${THUNDER_PUBLIC_URL}" \
     --set thunder.configuration.jwt.issuer="${THUNDER_PUBLIC_URL}" \
     --set thunder.configuration.gateClient.hostname="${THUNDER_PUBLIC_HOST}" \
@@ -297,6 +331,20 @@ kubectl wait --for=condition=Available \
   deployment -l app.kubernetes.io/instance=amp-thunder-extension \
   -n "${THUNDER_NS}" --timeout=300s
 
+log "Step 4: platform console admin password (generated, shown nowhere else)"
+# rc1 dropped `password: "admin"` from the chart's defaultUsers entry. An
+# admin-credentials.yaml template now resolves the password from
+# thunder.setup.admin.password, else a previously stored value, else
+# randAlphaNum 10, and writes it to this Secret — and leaving the value unset,
+# as this install does, is the documented production path. So this read is the
+# only way to learn it. The Secret comes from a pre-install hook at weight -20,
+# which is why it is also there on the already-installed path above.
+kubectl get secret amp-admin-credentials -n "${THUNDER_NS}" \
+  -o jsonpath='{.data.password}' | base64 -d \
+  | tee "${SECRETS_DIR}/console-admin-password.txt"
+echo
+chmod 600 "${SECRETS_DIR}/console-admin-password.txt"
+
 log "Step 4 verify: issuer must equal ${THUNDER_PUBLIC_URL}"
 kubectl exec -n "${THUNDER_NS}" deploy/amp-thunder-extension-deployment -- \
   wget -qO- http://localhost:8090/.well-known/openid-configuration 2>/dev/null \
@@ -306,8 +354,10 @@ kubectl exec -n "${THUNDER_NS}" deploy/amp-thunder-extension-deployment -- \
 
 log "Step 5: control-plane wildcard certificate"
 kubectl create namespace "${CONTROL_PLANE_NS}" --dry-run=client -o yaml | kubectl apply -f -
-# The third name matters: a DNS wildcard matches one label, so *.${BASE_DOMAIN}
-# does not cover the per-environment <org>-<env>.thunder.${BASE_DOMAIN} names.
+# Two names, not the three this used to carry: rc1's env-Thunder hosts are
+# <handle>.${BASE_DOMAIN}, a single label, so the *.${BASE_DOMAIN} wildcard
+# already covers them. The retired <org>-<env>.thunder.${BASE_DOMAIN} shape
+# needed a nested *.thunder wildcard because a DNS wildcard matches one label.
 kubectl apply -f - <<EOF
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -322,17 +372,30 @@ spec:
   dnsNames:
     - "*.${BASE_DOMAIN}"
     - "${BASE_DOMAIN}"
-    - "*.thunder.${BASE_DOMAIN}"
   privateKey:
     rotationPolicy: Always
 EOF
 kubectl wait --for=condition=Ready certificate/cp-gateway-tls -n "${CONTROL_PLANE_NS}" --timeout=600s
 
-log "Step 5: OpenChoreo control plane 1.1.1"
+log "Step 5: OpenChoreo control plane ${OPENCHOREO_VERSION} CRDs"
+# The chart keeps its CRDs in crds/, which Helm installs on first install and
+# NEVER touches on upgrade. So bumping OPENCHOREO_VERSION alone leaves the older
+# CRD set in place, and the failure lands two scripts later: 04's platform
+# resources chart dies with `no matches for kind "ClusterProjectType"`. Applied
+# explicitly here so an upgrade picks up new kinds. Not pruned — removing a CRD
+# deletes every object of that kind.
+CRD_TMP="$(mktemp -d)"
+helm pull oci://ghcr.io/openchoreo/helm-charts/openchoreo-control-plane \
+  --version "${OPENCHOREO_VERSION}" --untar --untardir "${CRD_TMP}" >/dev/null
+kubectl apply --server-side --force-conflicts \
+  -f "${CRD_TMP}/openchoreo-control-plane/crds/" >/dev/null
+rm -rf "${CRD_TMP}"
+
+log "Step 5: OpenChoreo control plane ${OPENCHOREO_VERSION}"
 install_control_plane() {
   helm upgrade --install --server-side=false openchoreo-control-plane \
     oci://ghcr.io/openchoreo/helm-charts/openchoreo-control-plane \
-    --version 1.1.1 \
+    --version "${OPENCHOREO_VERSION}" \
     --namespace "${CONTROL_PLANE_NS}" \
     --create-namespace \
     --values - <<EOF
@@ -368,7 +431,7 @@ gateway:
       - name: cp-gateway-tls
 EOF
 }
-# v1.1.1 has a known race where the chart's webhook has no endpoints yet.
+# The chart has a known race where the chart's webhook has no endpoints yet.
 install_control_plane || {
   warn "control-plane install failed — waiting for the webhook and retrying once"
   kubectl wait --for=condition=Available deployment --all -n "${CONTROL_PLANE_NS}" --timeout=300s || true
@@ -377,7 +440,7 @@ install_control_plane || {
 kubectl wait --for=condition=Available deployment --all -n "${CONTROL_PLANE_NS}" --timeout=300s
 
 log "Step 5: patching the service-account entitlement claim to client_id"
-# Thunder >=0.45 puts the client name in client_id; OpenChoreo 1.1.1 reads sub.
+# Thunder >=0.45 puts the client name in client_id; OpenChoreo reads sub.
 # Unpatched, every service-to-service call is silently unauthorized: 200s with
 # empty lists, and the gateway bootstrap later fails on 'Environment not found'.
 patch_entitlement_claim() {
@@ -461,7 +524,7 @@ kubectl wait --for=condition=Ready certificate/dp-gateway-tls -n "${DATA_PLANE_N
 # publishes assumes 80/443.
 helm upgrade --install --server-side=false openchoreo-data-plane \
   oci://ghcr.io/openchoreo/helm-charts/openchoreo-data-plane \
-  --version 1.1.1 \
+  --version "${OPENCHOREO_VERSION}" \
   --namespace "${DATA_PLANE_NS}" \
   --create-namespace \
   --set clusterAgent.tls.generateCerts=true \
@@ -500,7 +563,7 @@ log "Step 7: workflow plane"
 copy_gateway_ca "${BUILD_CI_NS}"
 helm upgrade --install --server-side=false openchoreo-workflow-plane \
   oci://ghcr.io/openchoreo/helm-charts/openchoreo-workflow-plane \
-  --version 1.1.1 \
+  --version "${OPENCHOREO_VERSION}" \
   --namespace "${BUILD_CI_NS}" \
   --create-namespace \
   --set clusterAgent.tls.generateCerts=true \
@@ -581,7 +644,7 @@ kubectl wait --for=condition=Ready certificate/obs-gateway-tls -n "${OBSERVABILI
 
 helm upgrade --install --server-side=false openchoreo-observability-plane \
   oci://ghcr.io/openchoreo/helm-charts/openchoreo-observability-plane \
-  --version 1.1.1 \
+  --version "${OPENCHOREO_VERSION}" \
   --namespace "${OBSERVABILITY_NS}" \
   --create-namespace \
   --set gateway.tls.enabled=true \
@@ -616,7 +679,7 @@ log "Step 8: observability modules"
 # Note the capital S in openSearch — it is the subchart alias.
 helm upgrade --install --server-side=false observability-logs-opensearch \
   oci://ghcr.io/openchoreo/helm-charts/observability-logs-opensearch \
-  --create-namespace --namespace "${OBSERVABILITY_NS}" --version 0.4.1 \
+  --create-namespace --namespace "${OBSERVABILITY_NS}" --version "${OBS_LOGS_OPENSEARCH_VERSION}" \
   --set openSearchSetup.openSearchSecretName="opensearch-admin-credentials" \
   --set adapter.openSearchSecretName="opensearch-admin-credentials" \
   --set "openSearch.persistence.size=${OPENSEARCH_PV_SIZE}" \
@@ -626,16 +689,16 @@ helm upgrade --install --server-side=false observability-logs-opensearch \
 
 helm upgrade observability-logs-opensearch \
   oci://ghcr.io/openchoreo/helm-charts/observability-logs-opensearch \
-  --namespace "${OBSERVABILITY_NS}" --version 0.4.1 \
+  --namespace "${OBSERVABILITY_NS}" --version "${OBS_LOGS_OPENSEARCH_VERSION}" \
   --reuse-values --set fluent-bit.enabled=true --timeout 10m
 
 helm upgrade --install --server-side=false observability-metrics-prometheus \
   oci://ghcr.io/openchoreo/helm-charts/observability-metrics-prometheus \
-  --create-namespace --namespace "${OBSERVABILITY_NS}" --version 0.6.1 --timeout 10m
+  --create-namespace --namespace "${OBSERVABILITY_NS}" --version "${OBS_METRICS_PROMETHEUS_VERSION}" --timeout 10m
 
 helm upgrade --install --server-side=false observability-traces-opensearch \
   oci://ghcr.io/openchoreo/helm-charts/observability-tracing-opensearch \
-  --create-namespace --namespace "${OBSERVABILITY_NS}" --version 0.4.1 \
+  --create-namespace --namespace "${OBSERVABILITY_NS}" --version "${OBS_TRACING_OPENSEARCH_VERSION}" \
   --set openSearch.enabled=false \
   --set openSearchSetup.openSearchSecretName="opensearch-admin-credentials" \
   --set opentelemetry-collector.configMap.existingName="amp-opentelemetry-collector-config" \
@@ -680,20 +743,51 @@ printf '  control-plane   %s\n  data-plane      %s\n  observability   %s\n' "$CP
 for host in "${CONSOLE_PUBLIC_HOST}" "${API_PUBLIC_HOST}" "${THUNDER_PUBLIC_HOST}" "${CP_GW_PUBLIC_HOST}"; do
   upsert_dns "${host}" "${CP_LB}" CNAME
 done
-# Keep an explicit thunder record: once *.thunder.${BASE_DOMAIN} exists, RFC 4592
-# makes thunder.${BASE_DOMAIN} an empty non-terminal that *.${BASE_DOMAIN} no
-# longer covers.
-upsert_dns "*.thunder.${BASE_DOMAIN}" "${CP_LB}" CNAME
+# This wildcard is required, not one of two possible layouts: rc1's env-Thunder
+# hostnames are <handle>.${BASE_DOMAIN}, minted per environment after install,
+# so they cannot be published up front. The four explicit records above stay —
+# they document intent, and the RFC 4592 empty-non-terminal hazard that made
+# them load-bearing disappeared along with the nested *.thunder wildcard. traces
+# and agents keep their own records below and still win over this one, since an
+# exact name always beats a wildcard.
+upsert_dns "*.${BASE_DOMAIN}"         "${CP_LB}"  CNAME
 upsert_dns "${OBS_API_PUBLIC_HOST}"   "${OBS_LB}" CNAME
 upsert_dns "${AGENTS_DOMAIN}"         "${DP_LB}"  CNAME
 upsert_dns "*.${AGENTS_DOMAIN}"       "${DP_LB}"  CNAME
 
 log "Waiting for DNS to resolve"
+# Two rules here, both learned the hard way:
+#
+# 1. Query a public resolver explicitly (§10). A bare `dig +short` goes to this
+#    machine's stub resolver, and the first query for a name that Route 53 has
+#    not published yet gets NXDOMAIN cached for the zone's negative TTL (900s).
+#    That poisons *this machine* for the next 15 minutes — which is what 04 uses
+#    to reach ${THUNDER_PUBLIC_URL} for am_token(), so 03 passing here used to be
+#    followed by 04 failing to resolve a host that resolves fine everywhere else.
+# 2. Fail loudly. The old loop `break`-ed on success and simply fell through on
+#    exhaustion, so a name that never resolved printed nothing and still exited 0.
 for host in "${THUNDER_PUBLIC_HOST}" "${OBS_API_PUBLIC_HOST}" "test.${AGENTS_DOMAIN}"; do
+  resolved=false
   for _ in $(seq 1 30); do
-    [[ -n "$(dig +short "$host")" ]] && { echo "  ${host} resolves"; break; }
+    if [[ -n "$(dig +short @1.1.1.1 "$host")" ]]; then
+      echo "  ${host} resolves"
+      resolved=true
+      break
+    fi
     sleep 10
   done
+  [[ "$resolved" == true ]] || die "${host} never resolved after 5 minutes — check the Route 53 records in ${ROUTE53_ZONE_ID}"
+done
+
+# Warm the local stub resolver too, and report rather than fail: an entry cached
+# NXDOMAIN before publication expires on its own, but 04 cannot proceed until it
+# does, so surfacing it here beats a confusing failure two scripts later.
+for host in "${THUNDER_PUBLIC_HOST}" "${API_PUBLIC_HOST}" "${CONSOLE_PUBLIC_HOST}"; do
+  if ! getent hosts "$host" >/dev/null 2>&1; then
+    warn "${host} resolves publicly but not through this machine's resolver."
+    warn "A negative answer is cached locally; it clears within the zone's 900s"
+    warn "negative TTL. Run 'resolvectl flush-caches' to clear it immediately."
+  fi
 done
 
 log "Phase 1 complete. Next: ./035-registry.sh then ./04-agent-manager.sh"

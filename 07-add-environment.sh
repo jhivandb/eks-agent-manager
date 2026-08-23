@@ -50,7 +50,12 @@ INGRESS_HOST="${ENV_NAME}-${ORG}.${AGENTS_DOMAIN}"
 EGRESS_HOST="${ENV_NAME}-${ORG}-egress.${AGENTS_DOMAIN}"
 
 ENV_THUNDER_RELEASE="amp-thunder-${ORG}-${ENV_NAME}"
-ENV_THUNDER_ISSUER="https://${ORG}-${ENV_NAME}.thunder.${BASE_DOMAIN}"
+# env-Thunder hostnames are handle-based: <handle>.${BASE_DOMAIN}. The handle is
+# generated once per (org, env) and reused forever, because Thunder's issuer is
+# minted from it and is immutable afterwards — a second handle for the same
+# environment reads as a different, unprovisioned one.
+ENV_HANDLE="$(env_thunder_handle "${ORG}" "${ENV_NAME}")"
+ENV_THUNDER_ISSUER="https://${ENV_HANDLE}.${BASE_DOMAIN}"
 ENV_THUNDER_JWKS="http://${ENV_THUNDER_RELEASE}-service.${ENV_THUNDER_RELEASE}.svc.cluster.local:8090/oauth2/jwks"
 AM_JWKS="http://amp-api.${AMP_NS}.svc.cluster.local:9000/auth/external/jwks.json"
 
@@ -85,10 +90,14 @@ esac
 
 # ============================================================ env-Thunder
 
-log "Provisioning env-Thunder for '${ENV_NAME}'"
+log "Provisioning env-Thunder for '${ENV_NAME}' at ${ENV_HANDLE}.${BASE_DOMAIN}"
 SCRIPT="${SECRETS_DIR}/add-environment-thunder.sh"
 curl -fsSL "${RAW_BASE}/deployments/scripts/add-environment-thunder.sh" -o "${SCRIPT}"
 
+# THUNDER_HANDLE is passed explicitly rather than letting the script generate
+# one: it registers the handle with agent-manager-service before touching the
+# cluster, and that PUT upserts for the same (org, env), so a re-run resolves to
+# the same host and issuer instead of minting a second, unrecorded handle.
 ENV_NAME="${ENV_NAME}" \
 DISPLAY_NAME="${DISPLAY_NAME}" \
 ORG_NAME="${ORG}" \
@@ -100,6 +109,7 @@ IDP_CLIENT_SECRET="${AMP_API_CLIENT_SECRET}" \
 PLATFORM_THUNDER_ISSUER="${THUNDER_PUBLIC_URL}" \
 PLATFORM_THUNDER_JWKS_URL="${THUNDER_PUBLIC_URL}/oauth2/jwks" \
 THUNDER_HOST_BASE_DOMAIN="${BASE_DOMAIN}" \
+THUNDER_HANDLE="${ENV_HANDLE}" \
 TLS_ENABLED=true \
 SKIP_CA_BUNDLE_TRUST=true \
 bash "${SCRIPT}"
@@ -241,6 +251,8 @@ Environment '${ENV_NAME}' ready.
   env-Thunder       ${ENV_THUNDER_ISSUER}     (admin password in ${SECRETS_DIR}/env-thunder-${ENV_NAME}-admin-password.txt)
   Pipeline          default -> ${ENV_NAME} promotion path added
 
-Both hostnames are covered by the existing *.${AGENTS_DOMAIN} DNS record and
-certificate; ${ORG}-${ENV_NAME}.thunder.${BASE_DOMAIN} by *.thunder.${BASE_DOMAIN}.
+Both gateway hostnames are covered by the existing *.${AGENTS_DOMAIN} DNS record
+and certificate, and ${ENV_HANDLE}.${BASE_DOMAIN} by the *.${BASE_DOMAIN} record
+and certificate 03 publishes — env-Thunder handles sit directly under the base
+domain, so nothing new has to be issued or published for an added environment.
 SUMMARY

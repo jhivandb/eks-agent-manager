@@ -45,6 +45,10 @@ TARGETS=(
   "${CONTROL_PLANE_NS}/gateway-default"
   "${DATA_PLANE_NS}/gateway-default"
   "${OBSERVABILITY_NS}/gateway-default"
+  # Absent on an rc1 install: 03 sets thunder.ocIngress.https.enabled=false,
+  # which drops the Thunder :8443 Gateway and the Service kgateway materializes
+  # for it. Listed anyway, because the flag is a choice 03 makes rather than a
+  # property of the release. patch_services skips what is not there.
   "${CONTROL_PLANE_NS}/amp-thunder-extension-https-gateway"
   "${OBSERVABILITY_NS}/openchoreo-observability-prometheus"
 )
@@ -69,10 +73,20 @@ my_public_ip() {
   echo "${ip}"
 }
 
+# Skips absent targets rather than dying on them. This loop is not
+# order-independent: a hard failure part-way through leaves every target after
+# it unpatched, and the last one is the unauthenticated Prometheus (§12) — so a
+# vpn run would report failure having locked down the plane gateways and left
+# Prometheus open to the internet.
 patch_services() {
-  local patch="$1"
+  local patch="$1" ns name
   for t in "${TARGETS[@]}"; do
-    kubectl patch svc "${t#*/}" -n "${t%%/*}" --type=merge -p "${patch}" >/dev/null
+    ns="${t%%/*}"; name="${t#*/}"
+    if ! kubectl get svc "${name}" -n "${ns}" >/dev/null 2>&1; then
+      echo "  ${t} — not present, skipped"
+      continue
+    fi
+    kubectl patch svc "${name}" -n "${ns}" --type=merge -p "${patch}" >/dev/null
     echo "  ${t}"
   done
 }

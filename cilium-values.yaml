@@ -28,7 +28,7 @@ operator:
 gatewayAPI:
   enabled: false
 
-# Left off to conserve headroom on a 3 x 4vCPU/8GB cluster. Enable if you need
+# Left off to conserve headroom on a 3 x 8vCPU/16GiB cluster. Enable if you need
 # flow visibility while debugging the platform install.
 hubble:
   enabled: false

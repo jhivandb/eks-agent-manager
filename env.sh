@@ -24,20 +24,53 @@ export DB_INSTANCE_CLASS="db.t4g.small"
 export DB_STORAGE_GB="50"
 export DB_MASTER_USER="postgres"
 
-# Agent Manager's own database, and the three Thunder keeps.
+# Agent Manager's own database, and the four Thunder keeps.
+#
+# Thunder 1.0.0-beta replaced the old configdb/runtimedb/userdb split with these
+# four. The names are also the datasource keys the chart expects (see the map in
+# 03-openchoreo.sh): a key the chart does not recognise is dropped in silence and
+# that datasource falls back to SQLite on a PVC, so a stale name here does not
+# fail — it quietly moves Thunder's state off RDS.
 export AMP_DB_NAME="agentmanager"
 export AMP_DB_USER="agentmanager"
 export THUNDER_DB_USER="thunder"
-export THUNDER_DBS="configdb runtimedb userdb"
+export THUNDER_DBS="configdb entitydb runtime_persistent runtime_transient"
 
 # ------------------------------------------------------- Agent Manager release
 
 # Must be a tag that exists BOTH as a GHCR chart tag and as a git tag named
 # amp/v${VERSION} — the install pulls values files from raw.githubusercontent at
-# that tag. The literal "0.0.0-dev" in the docs is a local-build placeholder and
-# is published under neither.
-export VERSION="0.0.0-dev-20260806"
+# that tag. This is a released tag, not one of the nightlies this repo tracked
+# before it: it does not move, and its images are not deleted out from under a
+# running cluster the next day.
+export VERSION="1.0.0-rc1"
 export HELM_CHART_REGISTRY="ghcr.io/wso2"
+
+# Upstream dependency versions. These are NOT independent of VERSION: each
+# release is built against one OpenChoreo line, and its extension charts
+# reference CRDs from it. The authoritative list is deployments/setup/env.sh in
+# the agent-manager repo at the matching tag:
+#
+#   curl -s https://raw.githubusercontent.com/wso2/agent-manager/amp/v${VERSION}/deployments/setup/env.sh
+#
+# Re-read it whenever VERSION moves. A stale OPENCHOREO_VERSION surfaces as
+# `no matches for kind "..." in version "openchoreo.dev/v1alpha1"` in 04, not as
+# anything resembling a version error (TROUBLESHOOTING §23).
+export OPENCHOREO_VERSION="1.2.0"
+export GATEWAY_OPERATOR_VERSION="0.11.0"
+# The operator deploys a separate gateway runtime chart; its version is NOT
+# implied by the operator's. 1.2.0-beta under operator 0.11.0 renders probes
+# with two handler types and the API server rejects the Deployment
+# (TROUBLESHOOTING §24).
+# No 1.2.1 gateway chart was ever published, so the chart and the image it
+# deploys now sit at different versions: the image-tag override below is what
+# carries the runtime forward.
+export GATEWAY_CHART_VERSION="1.2.0"
+export GATEWAY_IMAGE_VERSION="1.2.1"
+export OBS_LOGS_OPENSEARCH_VERSION="0.5.3"
+export OBS_TRACING_OPENSEARCH_VERSION="0.6.0"
+export OBS_METRICS_PROMETHEUS_VERSION="0.6.1"
+export AGENT_SANDBOX_VERSION="0.1.1"
 
 # ---------------------------------------------------------------- Hostnames
 
@@ -139,6 +172,33 @@ EOF
 generate_platform_secrets
 # shellcheck source=/dev/null
 source "${SECRETS_DIR}/platform-secrets.env"
+
+# One env-Thunder hostname label per environment, generated on first use and
+# reused forever. The handle is registered with agent-manager-service before the
+# environment is provisioned and Thunder's issuer is minted from it, so a second
+# value for the same (org, env) would read as a different, unprovisioned
+# environment — same generate-once-and-guard reasoning as the secrets above.
+#
+# The env- prefix keeps the handle clear of the reservedThunderHandles list
+# (console, api, thunder, ...), which agent-manager-service rejects because they
+# would collide with the platform's own fixed subdomains under this same base
+# domain. The ten hex characters are what make the label unguessable.
+env_thunder_handle() {
+  local org="$1" env_name="$2"
+  local f="${SECRETS_DIR}/thunder-handles.env"
+  local key="THUNDER_HANDLE_${org//-/_}_${env_name//-/_}"
+
+  [[ -f "$f" ]] && source "$f"
+  if [[ -z "${!key:-}" ]]; then
+    mkdir -p "${SECRETS_DIR}"; chmod 700 "${SECRETS_DIR}"
+    local handle="env-$(openssl rand -hex 5)"
+    umask 077
+    echo "export ${key}=\"${handle}\"" >> "$f"
+    chmod 600 "$f"
+    export "${key}=${handle}"
+  fi
+  printf '%s' "${!key}"
+}
 
 # ----------------------------------------------------------------- Helpers
 

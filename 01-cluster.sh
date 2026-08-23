@@ -63,7 +63,17 @@ KUBELET:.status.nodeInfo.kubeletVersion
 
 kernel="$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.kernelVersion}')"
 kernel_major_minor="$(echo "$kernel" | cut -d. -f1,2)"
-if awk "BEGIN{exit !(${kernel_major_minor} < 6.3)}"; then
+
+# Version-sort, not a numeric comparison. awk parses "6.12" and "6.3" as floats,
+# where 6.12 < 6.3 is true — so every 6.10+ kernel was reported as being below
+# 6.3 and the advice was to disable user-namespaced builds that in fact work.
+kernel_older_than() {
+  local have="$1" want="$2"
+  if [[ "$have" == "$want" ]]; then return 1; fi
+  [[ "$(printf '%s\n%s\n' "$have" "$want" | sort -V | head -1)" == "$have" ]]
+}
+
+if kernel_older_than "${kernel_major_minor}" 6.3; then
   warn "Kernel ${kernel} is below 6.3. User-namespaced agent builds will fail."
   warn "Install the Platform Resources chart with buildWorkflows.userNamespaces=false,"
   warn "or switch the nodegroup to an AMI with a newer kernel."
