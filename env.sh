@@ -16,6 +16,36 @@ export CLUSTER_NAME="amp-test"
 export K8S_VERSION="1.34"
 export CILIUM_VERSION="1.19.6"
 
+# ------------------------------------------------- gVisor isolation tier (08)
+
+# Additive: applied by ./08-gvisor.sh against an already-built cluster, and not
+# part of the 00->04 first-install path.
+#
+# Pinned to a dated release, never `latest`. Upstream's install-gvisor.sh reads
+# release/latest/<arch>/runsc, which 404s: gVisor stopped publishing loose
+# binaries between 20260817 and 20260831 and now ships only gvisor.tar.zstd /
+# .bz2. From 20260831 on the sentry is split into sidecar binaries under
+# gvisor-bin/ that must sit next to runsc, so the whole tarball is installed.
+export GVISOR_RELEASE="20260914"
+export GVISOR_NODEGROUP="ng-gvisor"
+export GVISOR_RUNTIME_CLASS="gvisor"
+
+# true = host network stack inside the pod's own netns. Syscall isolation is
+# unchanged either way; only the pod's network stack differs.
+#
+# This is "true" because "false" (gVisor's userspace netstack) was measured NOT
+# to work on this cluster, not as a precaution. A netstack sandbox reached other
+# pods by IP across nodes over TCP and UDP, but every Service ClusterIP timed
+# out: `cilium monitor` showed its packets arriving at to-netdev with the
+# ClusterIP still intact and forwarded to `world`, because gVisor's netstack
+# never traverses Cilium's from-container program. A runc pod on the same node
+# was fine. No Cilium setting fixes it — socketLB is already disabled here, so
+# socketLB.hostNamespaceOnly is inert (TROUBLESHOOTING §38).
+#
+# The bootstrap lives in the launch template, so changing this means recreating
+# the nodegroup: ./08-gvisor.sh uninstall && ./08-gvisor.sh.
+export GVISOR_NETWORK_HOST="true"
+
 # ------------------------------------------------------------------------- RDS
 
 export DB_INSTANCE_ID="${CLUSTER_NAME}-pg"
@@ -72,6 +102,16 @@ export OBS_LOGS_OPENSEARCH_VERSION="0.5.3"
 export OBS_TRACING_OPENSEARCH_VERSION="0.6.0"
 export OBS_METRICS_PROMETHEUS_VERSION="0.6.1"
 export AGENT_SANDBOX_VERSION="0.1.1"
+
+# Thunder resource_server id for the agent-manager MCP endpoint. The chart's own
+# default is 37 characters and RESOURCE_SERVER.id is varchar(36), so a fresh
+# 1.0.0 install fails in Thunder's pre-install bootstrap hook with
+# "pq: value too long for type character varying(36)" (TROUBLESHOOTING §37).
+#
+# FROZEN at install time, like every other Thunder bootstrap value: it is seeded
+# into configdb on first boot and referenced by the role-permission rows the
+# bootstrap writes. Changing it later is a platform-data reset, not an upgrade.
+export MCP_AGENT_MANAGER_RS_ID="amp-agent-manager-mcp-resource-srv"
 
 # ---------------------------------------------------------------- Hostnames
 

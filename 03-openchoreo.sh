@@ -286,6 +286,40 @@ THUNDER_VALUES="${SECRETS_DIR}/thunder-db-values.yaml"
             key: password
 EOF
   done
+
+  # The chart ships mcpResourceServers[0].id as
+  # "amp-agent-manager-mcp-resource-server" -- 37 characters against
+  # RESOURCE_SERVER.id varchar(36) in Thunder's configdb. On PostgreSQL the
+  # pre-install bootstrap hook dies with
+  #   pq: value too long for type character varying(36)
+  # and the whole Thunder install fails, so 1.0.0 cannot be installed fresh
+  # without this override (TROUBLESHOOTING §37).
+  #
+  # The whole list is restated rather than patched with --set: Helm REPLACES a
+  # list element addressed by index instead of merging into it, so
+  # `--set ...mcpResourceServers[0].id=x` drops baseUrlValue and the template
+  # then fails on a nil index. Both entries are reproduced verbatim from the
+  # chart's values.yaml except for the shortened id.
+  #
+  # This id is frozen state: it is written into Thunder's database on first
+  # boot and referenced by every role-permission row the bootstrap creates.
+  # Changing it later means a platform-data reset, not an upgrade.
+  cat <<EOF
+  bootstrap:
+    mcpResourceServers:
+      - name: "AMP Agent Manager MCP"
+        id: "${MCP_AGENT_MANAGER_RS_ID}"
+        handle: ""
+        baseUrlValue: "agentManagerMcpBaseUrl"
+        description: "Resource identifier for the agent-manager MCP endpoint"
+        permissionSet: "amp-minus-observability"
+      - name: "AMP Observer MCP"
+        id: "amp-observer-mcp-resource-server"
+        handle: ""
+        baseUrlValue: "observerMcpBaseUrl"
+        description: "Resource identifier for the observer MCP endpoint"
+        permissionSet: "observability-only"
+EOF
 } > "${THUNDER_VALUES}"
 
 if helm status amp-thunder-extension -n "${THUNDER_NS}" >/dev/null 2>&1; then

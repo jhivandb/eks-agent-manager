@@ -1,0 +1,152 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+# The gVisor (Sandboxing T2) node. Separate from nodegroup.yaml because that one
+# is applied during the first install while this is additive, and because
+# `eksctl create nodegroup -f` on a file containing both would try to reconcile
+# ng-default as well.
+#
+# This is a TEMPLATE. ./08-gvisor.sh renders it into .secrets/nodegroup-gvisor.yaml,
+# substituting the double-at delimited tokens from env.sh, and eksctl only reads the
+# rendered copy. Substitution is sed on those tokens and nothing else — a bare
+# `envsubst` here would eat ${tmp}, ${BASE} and every other shell variable in the
+# bootstrap block below.
+
+metadata:
+  name: amp-test
+  region: us-east-1
+  version: "1.34"
+  tags:
+    project: agent-manager-eval
+    owner: jhivan@wso2.com
+
+managedNodeGroups:
+  - name: ng-gvisor
+    amiFamily: AmazonLinux2023
+    # Same type as ng-default: gVisor's systrap platform intercepts syscalls in
+    # userspace and needs no KVM, so this tier does not need bare metal the way
+    # Kata would (see docs/superpowers/specs/2026-09-18-gvisor-isolation-tier-design.md).
+    instanceType: c8i-flex.2xlarge
+    desiredCapacity: 1
+    # minSize 0 so the node can be parked at $0 between sessions:
+    # ./08-gvisor.sh scale 0
+    minSize: 0
+    maxSize: 2
+    volumeSize: 50
+    volumeType: gp3
+    volumeEncrypted: true
+    privateNetworking: true
+    # Same ENI budget as ng-default — same instance type. c8i-flex.2xlarge
+    # reports 4 interfaces at 30 IPv4 each, one per interface being the
+    # interface's own, so 4 x 29 = 116 assignable and 110 keeps headroom.
+    # Cilium runs ENI IPAM with native routing, so this ceiling is hard.
+    maxPodsPerNode: 110
+    labels:
+      gvisor: "true"
+    taints:
+      # The tier's own taint, matched by the RuntimeClass's
+      # scheduling.tolerations. Keeps every platform pod off this node.
+      - key: gvisor
+        value: "true"
+        effect: NoSchedule
+      # Same as ng-default: keeps everything off the node until cilium-agent is
+      # ready on it. Cilium removes this one itself, which is why gVisor pods —
+      # whose toleration covers only the gvisor key — can land afterwards.
+      - key: node.cilium.io/agent-not-ready
+        value: "true"
+        effect: NoExecute
+    iam:
+      attachPolicyARNs:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      # cilium-operator uses the node instance profile to manage ENIs.
+      attachPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - ec2:DescribeVpcs
+              - ec2:DescribeSecurityGroups
+            Resource: "*"
+
+    # Installs runsc BEFORE containerd's first start. AL2023's nodeadm is two
+    # units: nodeadm-config.service (Before=cloud-init.service) writes
+    # /etc/containerd/config.toml, and nodeadm-run.service
+    # (After=cloud-final.service) starts containerd and kubelet.
+    # preBootstrapCommands run between them, which AL2023 opens deliberately —
+    # nodeadm-config's own comment is "run before cloud-init, then user can
+    # still execute their own workflows from ec2 userdata cloud-init scripts".
+    #
+    # So the config file exists here and containerd has NOT started. Nothing is
+    # reconfigured and nothing is restarted: the node is born with runsc
+    # registered. This is also why upstream's install-gvisor.sh cannot be used —
+    # it aborts unless `systemctl is-active containerd` is already true.
+    #
+    # A non-zero exit here does NOT fail the node: nodeadm-run.service is
+    # ordered After=cloud-final.service, which is satisfied whether cloud-init
+    # succeeded or not. A node whose bootstrap aborted still joins and reports
+    # Ready, with no runsc on it. Gate 1 in 08-gvisor.sh is the real check.
+    # Logs: /var/log/install-gvisor.log and /var/log/cloud-init-output.log.
+    preBootstrapCommands:
+      - |
+        set -euo pipefail
+        exec >>/var/log/install-gvisor.log 2>&1
+        echo "=== gVisor bootstrap $(date -Is) ==="
+
+        GVISOR_RELEASE="@@GVISOR_RELEASE@@"
+        NETWORK_HOST="@@GVISOR_NETWORK_HOST@@"
+        echo "release=${GVISOR_RELEASE} network_host=${NETWORK_HOST}"
+
+        # nodeadm-config.service has already written this. The wait is for the
+        # case where a future AMI reorders the units, so the failure is named.
+        for _ in $(seq 1 30); do [ -f /etc/containerd/config.toml ] && break; sleep 2; done
+        [ -f /etc/containerd/config.toml ] || { echo "nodeadm never wrote containerd config"; exit 1; }
+
+        # The CRI plugin table was renamed between containerd config versions, and
+        # appending the wrong one is SILENT -- containerd ignores the unknown
+        # table and every runsc pod then fails with "no runtime for \"runsc\"".
+        # AL2023 2023.12/containerd 2.2 writes version 3; older AMIs wrote 2.
+        # Upstream's install-gvisor.sh hardcodes the v2 name, which is why it
+        # would not work here even with its download fixed.
+        CFG=/etc/containerd/config.toml
+        ver="$(awk -F'=' '/^version[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "${CFG}")"
+        case "${ver}" in
+          3) PLUGIN="io.containerd.cri.v1.runtime" ;;
+          2) PLUGIN="io.containerd.grpc.v1.cri" ;;
+          *) echo "unexpected containerd config version: '${ver}'"; exit 1 ;;
+        esac
+        echo "containerd config version=${ver} plugin=${PLUGIN}"
+
+        # tar --zstd shells out to zstd, which the AL2023 EKS AMI does not guarantee.
+        command -v zstd >/dev/null || dnf install -y -q zstd
+
+        # The whole tarball, not two binaries: from release 20260831 on gVisor
+        # ships the sentry as sidecars in gvisor-bin/, which must sit next to
+        # runsc. Without them runsc either downloads ~100MB per cold start or
+        # uses an embedded fallback that stops working after 2026-10.
+        BASE="https://storage.googleapis.com/gvisor/releases/release/${GVISOR_RELEASE}/x86_64"
+        tmp="$(mktemp -d)"
+        curl -fsSL --retry 3 "${BASE}/gvisor.tar.zstd"        -o "${tmp}/gvisor.tar.zstd"
+        curl -fsSL --retry 3 "${BASE}/gvisor.tar.zstd.sha512" -o "${tmp}/gvisor.tar.zstd.sha512"
+        ( cd "${tmp}" && sha512sum -c gvisor.tar.zstd.sha512 )
+        tar --zstd -xf "${tmp}/gvisor.tar.zstd" -C /usr/local/bin \
+          runsc containerd-shim-runsc-v1 gvisor-bin
+        chmod 0755 /usr/local/bin/runsc /usr/local/bin/containerd-shim-runsc-v1
+        rm -rf "${tmp}"
+        /usr/local/bin/runsc --version
+
+        # Register the runtime. /usr/local/bin is on systemd's default PATH, so
+        # containerd resolves containerd-shim-runsc-v1 with no unit override.
+        # printf, not a heredoc: this whole block is a YAML block scalar, and a
+        # heredoc terminator indented to match the surrounding `if` would never
+        # close once YAML strips the common indentation.
+        if [ "${NETWORK_HOST}" = "true" ]; then
+          printf '\n# gVisor (runsc) runtime - host-network passthrough\n[plugins."%s".containerd.runtimes.runsc]\n  runtime_type = "io.containerd.runsc.v1"\n  [plugins."%s".containerd.runtimes.runsc.options]\n    TypeUrl = "io.containerd.runsc.v1.options"\n    ConfigPath = "/etc/containerd/runsc.toml"\n' "${PLUGIN}" "${PLUGIN}" >> "${CFG}"
+          printf '[runsc_config]\n  network = "host"\n' > /etc/containerd/runsc.toml
+        else
+          printf '\n# gVisor (runsc) runtime\n[plugins."%s".containerd.runtimes.runsc]\n  runtime_type = "io.containerd.runsc.v1"\n' "${PLUGIN}" >> "${CFG}"
+        fi
+
+        echo "=== gVisor bootstrap done $(date -Is) ==="
