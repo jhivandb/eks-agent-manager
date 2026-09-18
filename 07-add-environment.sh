@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Adds a new environment with split INGRESS/EGRESS gateways.
 #
-#   ./07-add-environment.sh <env-name> "<Display Name>" [--production]
+#   ./07-add-environment.sh <env-name> "<Display Name>" \
+#       [--production] [--isolation-tier <gvisor|kata>]
+#
+# --isolation-tier puts the environment's agents on a sandboxed runtime.
+# The tier's node and RuntimeClass must already exist: ./08-gvisor.sh.
 #
 # This replaces the product's deployments/scripts/add-environment.sh, which
 # hardcodes gateway vhosts to http://<env>-<org>.gateway.localhost:19080 with
@@ -31,11 +35,35 @@ kubeconfig_points_at_cluster
 
 ENV_NAME="${1:-}"
 DISPLAY_NAME="${2:-}"
-IS_PRODUCTION=false
-[[ "${3:-}" == "--production" ]] && IS_PRODUCTION=true
-
 [[ -n "${ENV_NAME}" && -n "${DISPLAY_NAME}" ]] \
-  || die "usage: $0 <env-name> \"<Display Name>\" [--production]"
+  || die "usage: $0 <env-name> \"<Display Name>\" [--production] [--isolation-tier <gvisor|kata>]"
+shift 2
+
+# Flags in any order after the two positionals, so the old
+# `07-add-environment.sh prod "Production" --production` form keeps working.
+IS_PRODUCTION=false
+ISOLATION_TIER=""
+while (( $# )); do
+  case "$1" in
+    --production)          IS_PRODUCTION=true ;;
+    --isolation-tier)      shift; ISOLATION_TIER="${1:-}" ;;
+    --isolation-tier=*)    ISOLATION_TIER="${1#*=}" ;;
+    *)                     die "unknown argument: $1" ;;
+  esac
+  shift
+done
+
+[[ "${ISOLATION_TIER}" =~ ^(gvisor|kata)?$ ]] \
+  || die "--isolation-tier must be 'gvisor' or 'kata', got '${ISOLATION_TIER}'"
+
+# Pre-flight the tier. Environments are provision-once, and one created against
+# a missing RuntimeClass leaves every agent Pending with nothing explaining why.
+if [[ -n "${ISOLATION_TIER}" ]]; then
+  rc="${ISOLATION_TIER}"; [[ "${rc}" == "kata" ]] && rc="kata-qemu"
+  kubectl get runtimeclass "${rc}" >/dev/null 2>&1 \
+    || die "isolation tier '${ISOLATION_TIER}' needs RuntimeClass '${rc}', which does not exist.
+Run ./08-gvisor.sh first. Environments cannot be reshaped after creation."
+fi
 [[ "${ENV_NAME}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] \
   || die "env name must be lowercase alphanumeric with hyphens"
 (( ${#ENV_NAME} <= 8 )) \
@@ -64,7 +92,7 @@ RAW_BASE="https://raw.githubusercontent.com/wso2/agent-manager/amp/v${VERSION}"
 
 # ============================================================ Environment
 
-log "Creating environment '${ENV_NAME}' (production=${IS_PRODUCTION})"
+log "Creating environment '${ENV_NAME}' (production=${IS_PRODUCTION}, isolation=${ISOLATION_TIER:-runc})"
 TOKEN="$(am_token "amp:environment:create amp:environment:read amp:gateway:create amp:gateway:read")"
 
 # The https listener variant must be present on a TLS install: the Environment's
@@ -75,16 +103,31 @@ code="$(curl -s -o /tmp/env-create-body -w '%{http_code}' -X POST \
   -H "Authorization: Bearer ${TOKEN}" \
   -H "Content-Type: application/json" \
   -d "$(jq -n --arg n "${ENV_NAME}" --arg d "${DISPLAY_NAME}" \
-        --arg h "${AGENTS_DOMAIN}" --argjson prod "${IS_PRODUCTION}" '{
+        --arg h "${AGENTS_DOMAIN}" --argjson prod "${IS_PRODUCTION}" \
+        --arg tier "${ISOLATION_TIER}" '{
     name: $n, displayName: $d, dataplaneRef: "default", dnsPrefix: $n,
     isProduction: $prod,
     gateway: {ingress: {external: {
       http:  {host: $h, port: 80},
       https: {host: $h, port: 443}
-    }}}}')")"
+    }}}}
+    # isolationTier is accepted ONLY on create, and is omitted entirely when no
+    # tier is set so runc environments send exactly the payload they always did.
+    + (if $tier == "" then {} else {isolationTier: $tier} end)')")"
 case "$code" in
   201) echo "  environment created" ;;
-  409) echo "  environment already exists, continuing" ;;
+  409)
+    echo "  environment already exists, continuing"
+    # The API takes isolationTier on create only. Observed behaviour on 1.0.0:
+    # a successful create stores the tier as the openchoreo.dev/isolation-tier
+    # annotation on the Environment rather than in its spec, so this sets the
+    # same annotation the API itself would have written.
+    if [[ -n "${ISOLATION_TIER}" ]]; then
+      warn "environment existed already; setting the tier by annotation instead"
+      kubectl annotate environment "${ENV_NAME}" -n "${DEFAULT_NS}" \
+        "openchoreo.dev/isolation-tier=${ISOLATION_TIER}" --overwrite
+    fi
+    ;;
   *)   die "environment create returned HTTP ${code}: $(cat /tmp/env-create-body)" ;;
 esac
 

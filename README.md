@@ -24,7 +24,8 @@ now baked into the scripts.
 | `035-registry.sh` | Container registry at `registry.<base>` | ~5 min |
 | `04-agent-manager.sh` | Phase 2: Agent Manager, extensions, env-Thunder | ~30 min |
 | `05-access.sh {public\|vpn}` | Locks the public endpoints + EKS API to the VPN, or reopens them | ~5 min |
-| `07-add-environment.sh <name> "<Display>" [--production]` | New environment: split gateways, env-Thunder, pipeline wiring | ~15 min |
+| `07-add-environment.sh <name> "<Display>" [--production] [--isolation-tier <tier>]` | New environment: split gateways, env-Thunder, pipeline wiring | ~15 min |
+| `08-gvisor.sh [verify\|scale <n>\|uninstall]` | **Additive, not part of `00`→`04`.** gVisor sandbox node, RuntimeClass, gates | ~10 min |
 | `99-teardown.sh [--keep-db] [--snapshot] [--yes]` | Destroys everything | ~25 min |
 
 `env.sh` holds all shared configuration and is sourced by the rest. It generates
@@ -52,6 +53,14 @@ a single NAT gateway, AZs pinned to `us-east-1a/b/c` because the flex instance
 families are not offered in every `us-east-1` zone and eksctl picks AZs at
 random. A managed nodegroup's `instanceType` is immutable, so changing it means
 a new nodegroup, not an edit.
+
+`08-gvisor.sh` adds a **fourth** node in its own `ng-gvisor` nodegroup, same
+instance type, for the gVisor isolation tier. It is dedicated and tainted
+`gvisor=true:NoSchedule`, so nothing but gVisor-tier agent pods ever lands on
+it, and it is born with `runsc` registered in containerd — the install happens
+in `preBootstrapCommands`, before containerd's first start, so no running node
+is ever reconfigured. `minSize: 0` means `./08-gvisor.sh scale 0` parks it at
+$0 between sessions.
 
 Cilium replaces both the CNI and kube-proxy (`disableDefaultAddons: true`), in
 ENI IPAM mode with native routing, so pods hold real VPC addresses. It must be
@@ -98,6 +107,24 @@ stay at 2 — neither holds shared state. A Redis backend is what lifts this.
 `SKIP_CA_BUNDLE_TRUST=true`, which requires publicly trusted certificates. The
 rate limit that bites is 5 *duplicate* certs per week; the four issued here are
 distinct names.
+
+**gVisor is installed by the nodegroup, not by `install-gvisor.sh`.** The
+upstream script is replaced rather than run, for three reasons: it downloads
+`release/latest/<arch>/runsc`, which 404s since gVisor moved to tarball-only
+releases; it installs two binaries where releases from `20260831` on also need
+the `gvisor-bin/` sidecars, without which every cold start either pulls ~100 MB
+or leans on a fallback that expires after 2026-10; and it aborts unless
+containerd is already running, which is false in the one window where EKS
+AL2023 lets this repo install declaratively. `nodegroup-gvisor.yaml`'s
+`preBootstrapCommands` do the whole job before containerd's first start, which
+also removes the doc's `cordon`/`drain` step — there is no live node to protect.
+See TROUBLESHOOTING §33–35.
+
+**Fluent Bit's sandbox toleration is a chart value, not a `kubectl patch`.** The
+isolation-tier docs prescribe patching the DaemonSet directly, but here Fluent
+Bit is a subchart of `observability-logs-opensearch`, so the next chart upgrade
+reverts it and agent logs silently stop arriving from the sandbox node.
+`08-gvisor.sh` sets `fluent-bit.tolerations[0].operator=Exists` instead.
 
 ## Things that are frozen at install time
 
@@ -186,6 +213,14 @@ moved — `c8i-flex.2xlarge` is twice the vCPU of the `m8i-flex.xlarge` this
 replaced, and roughly twice the hourly rate, so the node line is about $0.35/hr
 higher in total. Confirm the current on-demand rate for your region before
 budgeting; it is the largest single line here. Tear it down between sessions.
+
+The gVisor tier adds **~$0.356/hr** on top, for its one extra
+`c8i-flex.2xlarge`. `./08-gvisor.sh scale 0` parks it at $0 without destroying
+the nodegroup or the environment built on it. (Kata was the first choice for
+this tier and was abandoned here: it needs `/dev/kvm`, AWS offers hardware
+virtualization only on `*.metal`, and the cheapest x86 bare-metal instance in
+`us-east-1` is `c5n.metal` at **$3.89/hr** — more than double the entire rest of
+the cluster.)
 
 ## Re-running
 

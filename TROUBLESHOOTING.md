@@ -812,6 +812,335 @@ neither breaks nor becomes removable.
 
 ---
 
+# gVisor isolation tier, 2026-09-18 (Sandboxing T2)
+
+Adding `08-gvisor.sh`. All three were found before the tier was built; the
+first two are why upstream's `install-gvisor.sh` is replaced rather than run.
+
+## 33. `install-gvisor.sh` aborts on its first `curl`, and could not run here anyway
+
+**Symptom** — the documented Step 2, `curl ... install-gvisor.sh | sudo bash`,
+exits immediately with no useful message. `set -euo pipefail` is on and the
+first download fails.
+
+**Cause** — two independent ones.
+
+The script reads loose binaries from a floating `latest`:
+
+```
+BASE="https://storage.googleapis.com/gvisor/releases/release/latest/${GVISOR_ARCH}"
+for bin in runsc containerd-shim-runsc-v1; do
+```
+
+All four of those paths (both binaries and both `.sha512` files) return **404**.
+gVisor stopped publishing loose binaries between releases `20260817` and
+`20260831`; `latest/` and every release from `20260831` on hold only
+`gvisor.tar.zstd` and `gvisor.tar.bz2`:
+
+| Release | `x86_64/` contents |
+|---|---|
+| `20260810`, `20260817` | `runsc`, `containerd-shim-runsc-v1`, `runsc-metric-server`, `gvisor.tar.bz2` |
+| `20260831` onward, `latest` | `gvisor.tar.bz2`, `gvisor.tar.zstd` |
+
+Separately, the script hard-requires a running containerd:
+
+```bash
+if ! systemctl is-active containerd &>/dev/null; then
+    echo "❌ containerd service is not running."
+    exit 1
+fi
+```
+
+On EKS AL2023 that is false at the only point this repo can install
+declaratively. nodeadm is two units: `nodeadm-config.service`
+(`Before=cloud-init.service`) **writes** `/etc/containerd/config.toml`, and
+`nodeadm-run.service` (`After=cloud-final.service`) **starts** containerd and
+kubelet. `preBootstrapCommands` run between them — a window AL2023 opens
+deliberately, per `nodeadm-config`'s own comment, *"run before cloud-init, then
+user can still execute their own workflows from ec2 userdata cloud-init
+scripts"*. The config file exists there and containerd has not started, so the
+precondition can never be met.
+
+**Fix** — `nodegroup-gvisor.yaml`'s `preBootstrapCommands` install the pinned
+release tarball and append the runtime block themselves. This is strictly better
+than what the doc describes: the doc warns that installing `runsc`
+*"reconfigures and restarts containerd, which must never be done on a node
+serving live workloads"* and prescribes `cordon`/`drain`. Here nothing is
+reconfigured and nothing restarts — the node is **born** with runsc registered,
+and arrives already carrying `gvisor=true` and `gvisor=true:NoSchedule` so no
+platform pod can ever have been on it.
+
+**Watch for** — a failed bootstrap still yields a **`Ready` node**.
+`nodeadm-run.service` is ordered `After=cloud-final.service`, which is satisfied
+whether cloud-init's scripts succeeded or not, so the node joins with no runsc
+on it and nothing looks wrong. Gate 1 in `08-gvisor.sh` is the only real check;
+the log is `/var/log/install-gvisor.log`.
+
+## 34. Agent cold starts stall, or pull ~100 MB each
+
+**Symptom** — gVisor pods take a long time to start, or the node shows large
+outbound transfers from `runsc` at sandbox start. After 2026-10, sandboxes fail
+outright.
+
+**Cause** — installing only `runsc` and `containerd-shim-runsc-v1`, which is
+what `install-gvisor.sh` does and all the `20260817` release offers. From
+`20260831` on gVisor ships the sentry as **sidecar binaries** that must sit next
+to `runsc`:
+
+```
+runsc
+containerd-shim-runsc-v1
+gvisor-bin/{gvisor_sentry,checkpointgofer,gvisor-sentry-prewarmer,runsc-fd-parking,runsc-metric-server}
+```
+
+`runsc flags` on `release-20260914.0` spells out the consequences:
+`-sidecar-usage-policy` accepts `STRICT` (sidecars must exist) or
+`LEGACY_DEPRECATED_SLOW_EMBEDDED_FALLBACK`, *"use embedded fallbacks if sidecars
+are missing; **will stop working after 2026-10**"*, alongside a download policy
+the binary itself describes as *"This flag will go away in a few weeks!"*.
+
+**Fix** — extract the whole tarball (`runsc`, `containerd-shim-runsc-v1` **and**
+`gvisor-bin/`) into `/usr/local/bin`, which the bootstrap does. Note that
+`-sidecar-usage-policy=STRICT` is deliberately **not** set: with the sidecars
+present the default already uses them, so STRICT would only turn a broken
+install from slow into loud — and an unknown flag in `runsc.toml` fails every
+sandbox, so hardcoding a flag gVisor calls temporary trades a quiet failure for
+a total one on the next release bump.
+
+## 35. Agents run, but have no DNS, traces or metrics
+
+**This was the predicted form of §38, and §38 is what actually happened.** It is
+kept as its own entry because the symptom reaches you from the other end: not a
+failing gate during install, but a working-looking environment whose agents
+quietly have no telemetry.
+
+**Symptom** — pods in the gVisor environment are `Running`, their own workload
+behaves, and nothing resolves cluster DNS or reaches the observability
+endpoints. Nothing in the control plane names a cause.
+
+**Cause and fix** — see §38. gVisor's userspace netstack never traverses
+Cilium's `from-container` program, so Service ClusterIPs are forwarded
+untranslated and time out. `GVISOR_NETWORK_HOST="true"` in `env.sh`, then
+`./08-gvisor.sh uninstall && ./08-gvisor.sh`.
+
+The reason gate 3 exists at all is this entry: a `Running` pod proves nothing
+about a sandbox's networking, so `08-gvisor.sh` resolves `kubernetes.default`
+from inside one before it reports success.
+
+## 36. The containerd CRI plugin table was renamed, and appending the wrong one is silent
+
+**Symptom** — the node is `Ready`, `runsc --version` works on it, the
+RuntimeClass exists, and every gVisor pod still fails with
+`no runtime for "runsc" is configured`.
+
+**Cause** — containerd renamed the CRI runtime plugin between config versions:
+
+| config `version` | CRI runtime plugin table |
+|---|---|
+| 2 | `plugins."io.containerd.grpc.v1.cri"` |
+| 3 | `plugins."io.containerd.cri.v1.runtime"` |
+
+containerd does not complain about an unknown plugin table — it ignores it. So
+appending the v2 block to a v3 config produces a runtime that looks installed
+from every angle except the one that matters.
+
+This bit the design rather than the install, and it was caught by reading the
+real file off a running `ng-default` node over SSM instead of trusting the
+nodeadm template:
+
+```
+$ aws ssm send-command --instance-ids <id> --document-name AWS-RunShellScript \
+    --parameters 'commands=["head -1 /etc/containerd/config.toml"]'
+version = 3
+```
+
+AL2023 `2023.12.20260909` with containerd `2.2.7` writes **`version = 3`**.
+Upstream's `install-gvisor.sh` hardcodes the **v2** table, so on a current EKS
+AL2023 node it would leave a silently dead runtime even if its download were
+fixed (§33) — a second, independent reason that script cannot be used here.
+
+**Fix** — `nodegroup-gvisor.yaml`'s bootstrap reads the version out of the file
+and selects the table, and rejects a version it does not recognise rather than
+guessing:
+
+```bash
+ver="$(awk -F'=' '/^version[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "${CFG}")"
+case "${ver}" in
+  3) PLUGIN="io.containerd.cri.v1.runtime" ;;
+  2) PLUGIN="io.containerd.grpc.v1.cri"   ;;
+  *) echo "unexpected containerd config version: '${ver}'"; exit 1 ;;
+esac
+```
+
+Verified against the node's real v3 config and a synthetic v2 one, in both
+network modes: the correct table is written, the existing `runc` runtime is left
+intact, and an unknown version aborts loudly.
+
+## 37. Thunder 1.0.0 cannot bootstrap on PostgreSQL: a 37-character id in a `varchar(36)` column
+
+**Symptom** — `03-openchoreo.sh` dies part-way through Step 4:
+
+```
+Error: INSTALLATION FAILED: failed pre-install: resource Job/amp-thunder/
+amp-thunder-extension-setup not ready. status: Failed, message: Job Failed. failed: 1/1
+```
+
+Helm's hook policy deletes the pod, so there are no logs to read by the time the
+error surfaces. Re-running the job's pod template standalone gives the real one:
+
+```
+level=ERROR msg="Failed to create resource server" component=ResourceMgtService
+  error="failed to create resource server: pq: value too long for type character varying(36)"
+level=ERROR msg="In-process bootstrap failed; exiting"
+  error="bootstrap import failed for 1 resource(s):
+         resource_server \"AMP Agent Manager MCP\" (SSE-5000): Internal server error"
+```
+
+**Cause** — the chart's own `values.yaml` ships
+
+```yaml
+mcpResourceServers:
+  - name: "AMP Agent Manager MCP"
+    id: "amp-agent-manager-mcp-resource-server"   # 37 characters
+  - name: "AMP Observer MCP"
+    id: "amp-observer-mcp-resource-server"        # 32 characters
+```
+
+and Thunder's own schema declares `RESOURCE_SERVER.id varchar(36)`. The first id
+is one character too long, the second fits, which is why exactly one resource
+fails. Nothing about this install produces the value — it is a hardcoded chart
+default, so **every fresh 1.0.0 install on PostgreSQL hits it**. SQLite does not
+enforce `varchar` lengths, which is presumably why it shipped.
+
+Confirmed against the live schema:
+
+```
+$ psql -d configdb -c "select table_name||'.'||column_name from information_schema.columns
+                       where character_maximum_length=36"
+ RESOURCE_SERVER.id
+ ...
+```
+
+**Fix** — override the id. `env.sh` holds it as `MCP_AGENT_MANAGER_RS_ID`
+(`amp-agent-manager-mcp-resource-srv`, 34 chars) and `03` writes the whole
+`mcpResourceServers` list into the generated Thunder values file.
+
+The **whole list** is restated rather than patched with `--set`, because Helm
+*replaces* a list element addressed by index instead of merging into it:
+
+```
+$ helm template ... --set 'thunder.bootstrap.mcpResourceServers[0].id=shorter'
+Error: ... at <index $.Values.thunder.bootstrap $server.baseUrlValue>:
+       error calling index: value is nil; should be of type string
+```
+
+`--set` dropped `baseUrlValue` from that element and the template then failed on
+the nil lookup. Both entries are therefore reproduced verbatim from the chart
+except for the shortened id, which renders into all five places that reference
+it (the resource server itself plus four `resourceServerId` role-permission
+blocks).
+
+**This id is frozen state.** It is seeded into `configdb` on first boot and
+referenced by every role-permission row the bootstrap writes, so changing it
+later is a platform-data reset, not an upgrade — same class as the handles and
+client secrets in §22 and the README's frozen-at-install list.
+
+**Recovery if you hit it before the fix** — the bootstrap is not transactional.
+It had already written 2 resource servers, 25 resources and 103 actions before
+it aborted, and `ROLE` was still empty, so the databases are partly seeded and
+Thunder will never re-seed them. Uninstall the failed release and drop and
+recreate Thunder's four databases, then re-run `02-rds.sh` (which recreates them
+and reloads the schema) before `03`.
+
+## 38. gVisor's netstack bypasses Cilium's per-endpoint datapath, so ClusterIPs never resolve
+
+**Symptom** — gate 3 of `08-gvisor.sh` fails. A gVisor pod can reach other pods
+by IP, across nodes, over both TCP and UDP, but every Service ClusterIP times
+out — including `kube-dns`, so nothing resolves:
+
+```
+--- gvisor pod ---
+  DNS via ClusterIP 172.20.0.10  : ;; connection timed out; no servers could be reached
+  DNS direct to coredns pod IP   : Address: 172.20.0.1      <- works
+  TCP 53 to coredns pod IP       : TCP OK                   <- works
+  TCP 443 to ClusterIP 172.20.0.1: TCP FAIL
+--- runc pod, same node ---
+  DNS via ClusterIP 172.20.0.10  : Address: 172.20.0.1      <- works
+```
+
+**Cause** — not a general networking failure, and not the node: a runc pod on
+the *same* sandbox node resolves fine, Cilium is healthy there, and
+`cilium-dbg service list` on that node has the right backends. It is specifically
+**Service translation**. `cilium-dbg monitor` on the sandbox node, while the
+gVisor pod queries the ClusterIP:
+
+```
+-> network flow 0x0, identity 21339->world state new ifindex enp39s0
+   orig-ip 0.0.0.0: 10.0.158.2:27242 -> 172.20.0.10:53 udp
+```
+
+The packet reaches `to-netdev` with the **ClusterIP still intact** and an
+identity of `world`, and is forwarded out the node's uplink into the VPC, where
+`172.20.0.10` means nothing. No DNAT happened. The same query from a runc pod
+produces no datapath trace at all — it is translated before it ever reaches the
+datapath. gVisor's userspace netstack does not traverse Cilium's
+`from-container` program, so no Cilium setting translates ClusterIPs for it.
+
+Worth stating because it is the obvious thing to reach for: Cilium's
+`socketLB.hostNamespaceOnly=true` is **not** the fix. socketLB is already
+disabled on this cluster (`bpf-lb-sock: false`), so that flag is inert here.
+
+**Fix** — `GVISOR_NETWORK_HOST="true"` in `env.sh`, then
+`./08-gvisor.sh uninstall && ./08-gvisor.sh`. That configures the runsc shim
+with `network = "host"` in `/etc/containerd/runsc.toml`, which uses the host
+network stack inside the pod's own netns. **Syscall isolation is unchanged** —
+that is what the tier is for — and only the pod's network stack differs. The
+recreate is needed because the bootstrap lives in the nodegroup's launch
+template, not on the node.
+
+## 39. `035`'s registry probe blamed DNS for a registry that was answering fine
+
+**Symptom** — `035-registry.sh` deployed the registry, published its DNS record,
+then died after five minutes of retrying:
+
+```
+ERROR: registry unreachable at https://registry.amp.lyuda.xyz/v2/ — check DNS
+propagation and the internal LB
+```
+
+DNS and the load balancer were both fine. A pod started by hand got `HTTP 200`
+from that exact URL moments later.
+
+**Cause** — the probe read the verdict off `kubectl run`'s streamed stdout:
+
+```bash
+if kubectl run registry-probe --rm -i --restart=Never --image=alpine:3 --quiet -- \
+     sh -c "... && curl -sf https://${REGISTRY_HOST}/v2/ -o /dev/null && echo OK" \
+     2>/dev/null | grep -q OK; then
+```
+
+With `--rm`, kubectl's attach races the pod's deletion, so a probe that ran
+perfectly well on the cluster can deliver no output here — and `grep -q OK` then
+reports failure for a healthy registry. The tell was a **`Completed`**
+`registry-probe` pod still sitting in the namespace after the script had given
+up: the probe had succeeded, and only its output was lost.
+
+Compounding it, the pre-loop `kubectl delete pod registry-probe` ran **once**,
+outside the retry loop. Any pod left behind made every later attempt fail
+instantly on "already exists", so the 20 attempts burned their five minutes of
+sleeps without ever testing anything again.
+
+**Fix** — make the pod's exit phase the verdict and delete it before each
+attempt. `probe_registry()` now runs the pod without `--rm`, polls
+`.status.phase` until it is `Succeeded` or `Failed`, and returns on that.
+Nothing depends on capturing stdout through an attach.
+
+The general shape is worth keeping in mind: **a retry loop whose failure mode is
+"could not observe the result" reports the same thing as "the thing is broken"**,
+and it had already been given a plausible-sounding error message pointing at DNS.
+
+---
+
 # Caught while writing the scripts (never hit at runtime)
 
 These were found by reading source/docs before execution; they are recorded

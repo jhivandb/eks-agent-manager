@@ -133,16 +133,39 @@ upsert_dns "${REGISTRY_HOST}" "${REGISTRY_LB}" CNAME
 
 log "Verifying the registry from inside the cluster"
 # It resolves to a private address, so this has to run from a pod, not here.
-kubectl delete pod registry-probe -n "${REGISTRY_NS}" --ignore-not-found >/dev/null 2>&1 || true
+#
+# The pod's exit phase is the verdict, not its streamed stdout. `kubectl run
+# --rm -i ... | grep -q OK` looked equivalent and was not: with --rm, kubectl's
+# attach races the pod's deletion, so a probe that ran fine on the cluster can
+# still deliver no output here -- and the loop then retried a healthy registry
+# 20 times and died, leaving a `Completed` registry-probe pod behind as the only
+# evidence that it had in fact worked. The delete also has to be inside the
+# loop: one leftover pod otherwise makes every later attempt fail instantly on
+# "already exists", burning the retry budget without testing anything.
+probe_registry() {
+  kubectl delete pod registry-probe -n "${REGISTRY_NS}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+  kubectl run registry-probe -n "${REGISTRY_NS}" --restart=Never \
+    --image=public.ecr.aws/docker/library/alpine:3 --command -- \
+    sh -c "apk add --no-cache curl >/dev/null 2>&1 && curl -sf https://${REGISTRY_HOST}/v2/ -o /dev/null" \
+    >/dev/null 2>&1 || return 1
+  local phase=""
+  for _ in $(seq 1 30); do
+    phase="$(kubectl get pod registry-probe -n "${REGISTRY_NS}" \
+      -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    [[ "${phase}" == "Succeeded" || "${phase}" == "Failed" ]] && break
+    sleep 2
+  done
+  [[ "${phase}" == "Succeeded" ]]
+}
+
 for attempt in $(seq 1 20); do
-  if kubectl run registry-probe -n "${REGISTRY_NS}" --rm -i --restart=Never \
-       --image=public.ecr.aws/docker/library/alpine:3 --quiet -- \
-       sh -c "apk add --no-cache curl >/dev/null 2>&1 && curl -sf https://${REGISTRY_HOST}/v2/ -o /dev/null && echo OK" 2>/dev/null | grep -q OK; then
+  if probe_registry; then
     echo "  registry answers /v2/ over verified TLS"
     break
   fi
   [[ $attempt -eq 20 ]] && die "registry unreachable at https://${REGISTRY_HOST}/v2/ — check DNS propagation and the internal LB"
   sleep 15
 done
+kubectl delete pod registry-probe -n "${REGISTRY_NS}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
 log "Registry ready at ${REGISTRY_ENDPOINT}. Next: ./04-agent-manager.sh"
