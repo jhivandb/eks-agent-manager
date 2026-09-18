@@ -35,7 +35,7 @@ else
 
   # Pods stay Pending until nodes exist. cilium-operator tolerates every taint,
   # so it schedules onto the not-yet-Ready nodes the next step creates.
-  helm install cilium cilium/cilium \
+  helm install --server-side=false cilium cilium/cilium \
     --version "${CILIUM_VERSION}" \
     --namespace kube-system \
     -f "${SCRIPT_DIR}/cilium-values.yaml" \

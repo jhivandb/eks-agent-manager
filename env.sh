@@ -43,7 +43,7 @@ export THUNDER_DBS="configdb entitydb runtime_persistent runtime_transient"
 # that tag. This is a released tag, not one of the nightlies this repo tracked
 # before it: it does not move, and its images are not deleted out from under a
 # running cluster the next day.
-export VERSION="1.0.0-rc1"
+export VERSION="1.0.0"
 export HELM_CHART_REGISTRY="ghcr.io/wso2"
 
 # Upstream dependency versions. These are NOT independent of VERSION: each
@@ -62,10 +62,11 @@ export GATEWAY_OPERATOR_VERSION="0.11.0"
 # implied by the operator's. 1.2.0-beta under operator 0.11.0 renders probes
 # with two handler types and the API server rejects the Deployment
 # (TROUBLESHOOTING §24).
-# No 1.2.1 gateway chart was ever published, so the chart and the image it
-# deploys now sit at different versions: the image-tag override below is what
-# carries the runtime forward.
-export GATEWAY_CHART_VERSION="1.2.0"
+# The chart also trails the images: 1.2.1 controller/runtime images are
+# published but no chart matches them, and 1.2.2 — the newest chart — still
+# defaults to 1.2.0 images. Pinning the chart alone leaves the runtime a version
+# behind, so the image-tag override below is what actually carries it forward.
+export GATEWAY_CHART_VERSION="1.2.2"
 export GATEWAY_IMAGE_VERSION="1.2.1"
 export OBS_LOGS_OPENSEARCH_VERSION="0.5.3"
 export OBS_TRACING_OPENSEARCH_VERSION="0.6.0"

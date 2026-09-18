@@ -1,9 +1,10 @@
 # Agent Manager on EKS
 
 Scripted install of WSO2 Agent Manager (the release pinned as `VERSION` in
-`env.sh`, currently `1.0.0-rc1`) on a fresh EKS cluster, following
-`documentation/docs/getting-started/on-your-environment.mdx`
-(the `next` docs) with production variants throughout.
+`env.sh`, currently `1.0.0`) on a fresh EKS cluster, following
+[Install on Your Own Environment](https://wso2.github.io/agent-manager/docs/v1.0.0/guides/on-your-environment/)
+(`documentation/docs/guides/on-your-environment.mdx` upstream) with production
+variants throughout.
 
 **Run these with `bash`, not fish.** The install uses heredocs and `export`
 semantics fish does not share.

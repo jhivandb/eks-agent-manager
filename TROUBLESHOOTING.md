@@ -129,7 +129,7 @@ cainjector patches `caBundle` the same way and would have thrown the identical
 conflict on the next re-run.
 
 **Fix** — `--server-side=false` on every `helm install` / `helm upgrade
---install` in `03`/`04`, restoring Helm 3 apply semantics wholesale. The bare
+--install` in every script here, restoring Helm 3 apply semantics wholesale. The bare
 `helm upgrade` reconfigure calls stay on `--server-side=auto`, which inherits
 the client-side method from the release they upgrade. This was the flagged
 "Helm v4.2.0 vs a guide written for v3.12+" risk actually biting.
@@ -728,6 +728,87 @@ the audience, so a fresh install inherits rc1's defaults with no edit; the
 rename is one of the reasons a re-used Thunder database would be wrong. The
 scopes `07-add-environment.sh` requests (`amp:environment:*`, `amp:gateway:*`)
 were not touched by the rename.
+
+---
+
+# 1.0.0 GA, 2026-09-18 (`1.0.0-rc1` → `1.0.0`)
+
+GA gave every chart its first `values.schema.json`, with
+`additionalProperties: false` on the objects these scripts set. That changes the
+character of a stale value: under rc1 an unrecognised key was dropped in silence
+and the default stood, and now it refuses the install outright. Loud is better,
+but it means a pin bump alone does not carry this repo forward.
+
+## 30. `thunderHostBaseDomain` is refused outright
+
+**Symptom** — `04` dies before rendering anything:
+
+```
+Error: values don't meet the specifications of the schema(s) in the following chart(s):
+wso2-agent-manager:
+- at '/console/config': additional properties 'thunderHostBaseDomain' not allowed
+```
+
+**Cause** — 1.0.0 renamed `thunderHostBaseDomain` to `idpHostBaseDomain` on both
+`agentManagerService.config` and `console.config`. The rename reaches past the
+ConfigMap: the db-migration Job now reads `IDP_HOST_BASE_DOMAIN` too, because
+migration 043 backfills handle-only env-Thunder rows and would otherwise persist
+`amp.localhost` URLs into them.
+
+**Fix** — both `--set`s in `04` use the new name. The `THUNDER_HOST_BASE_DOMAIN`
+*environment variable* that `04` and `07` pass to `add-environment-thunder.sh`
+did **not** change — that script is byte-identical between rc1 and GA, so
+renaming it there would break env-Thunder provisioning instead.
+
+**The same schema vindicates an existing deviation.** `console.config.tlsEnabled`
+is typed `string` and `agentManagerService.config.tlsEnabled` is typed `boolean`.
+These scripts already used `--set-string` for the console's copy; the guide uses
+a plain `--set` for both, which now fails with `got boolean, want string`. The
+guide's own Phase 2 command does not run as printed.
+
+**And it caught a second pair.** `agentManagerService.config.agentsHttpPort` and
+`agentsHttpsPort` are typed `string` (their defaults are `"19080"` and `"443"`),
+while the `environment.gateway.http.port` they must agree with on the
+platform-resources chart is typed `integer`. Shell quoting does not carry:
+`--set key="80"` hands Helm a bare `80`, which it coerces to a number, so the
+amp half needs `--set-string` and the platform-resources half must not have it.
+Grepping for a stale key name would never have found this — it only appears when
+the chart is actually rendered.
+
+## 31. MCP resource identifiers moved, and the chart finally registers them
+
+**Symptom** — none on a cluster built fresh at 1.0.0. Against a Thunder database
+seeded at rc1, an MCP client's authorize request returns `invalid_target`.
+
+**Cause** — two changes that only agree with each other. The RFC 8707 resource
+identifier for both MCP endpoints went from `<publicUrl>/` to `<publicUrl>/mcp`
+(the MCP spec prefers the canonical URI without a trailing slash), and the
+accepted-audience helpers in the amp and observer charts were changed to append
+`/mcp` to match. Separately the Thunder extension gained a
+`60-mcp-resource-servers.yaml` bootstrap file, so those resource servers are now
+registered by the chart at all — under rc1 the values existed but no template
+consumed them, and registration only happened if you ran upstream's
+`register-amp-resources.sh` by hand, which these scripts never did.
+
+**Fix** — nothing to change here: `03` already passes `agentManagerMcpBaseUrl`
+and `observerMcpBaseUrl` as the public URLs and the chart derives the rest. But
+the bootstrap is a `pre-install` hook and `03` skips Thunder when a release
+already exists, so this only lands on a Thunder installed fresh at 1.0.0 — the
+same reason §26 and §29 are rebuild-only.
+
+## 32. The gateway runtime chart moved to 1.2.2 and the images did not
+
+**Cause** — upstream's `deployments/setup/env.sh` pins `GATEWAY_CHART_VERSION`
+to `1.2.2` at the GA tag. 1.2.2's own defaults still point at `1.2.0` controller
+and runtime images, and no chart matching the published `1.2.1` images was ever
+cut, so the image-tag overrides §24 added are still the only thing carrying the
+runtime forward — the two pins remain independent.
+
+**Fix** — `GATEWAY_CHART_VERSION="1.2.2"` in `env.sh`, nothing else. The
+1.2.0→1.2.2 values diff is additive (admin `config_dump` gating, a `config_toml`
+passthrough replacing `systemEnv`, a traffic-log volume), and the explicit probe
+handlers `04` sets still match 1.2.2's own defaults exactly, so §24's workaround
+neither breaks nor becomes removable.
 
 ---
 

@@ -195,22 +195,27 @@ log "Step 2: Agent Manager on external PostgreSQL"
 #                         port 8090 is plain HTTP, so https:// against it fails
 #                         the connection outright. Our public name resolves from
 #                         inside the pod anyway (NAT hairpin, see README).
-#   thunderHostBaseDomain The base every env-Thunder host hangs off. rc1 builds
+#   idpHostBaseDomain     The base every env-Thunder host hangs off. rc1 builds
 #                         "<handle>.<domain>" from the handle registered for the
 #                         environment; the old "<org>-<env>.thunder.<domain>"
 #                         shape is gone. Left at amp.localhost this API reports
-#                         env-Thunder endpoints that do not exist.
+#                         env-Thunder endpoints that do not exist. Renamed from
+#                         thunderHostBaseDomain in 1.0.0 (§30).
 #   agents/gatewayBaseDomain  Added environments resolve nowhere without these.
 #   agentsHttpPort        Must match environment.gateway.http.port set on the
 #                         platform-resources chart at the end of this script;
-#                         19080 is the k3d port mapping.
+#                         19080 is the k3d port mapping. --set-string because
+#                         this pair is typed string here and integer there —
+#                         plain --set sends a number and 1.0.0's schema
+#                         refuses it (§30).
 #
-# Three more that rc1's guide adds: agentsHttpsPort is the https half of that
-# same pair, and the console needs its own copy of thunderHostBaseDomain and
-# tlsEnabled to build env-Thunder sign-in URLs. The console's tlsEnabled is
-# --set-string deliberately — the chart declares that one as a quoted string
-# ("false") while agentManagerService.config.tlsEnabled is a real bool, so plain
-# --set would write a bool into a string field. The guide uses --set for both.
+# Three more the guide adds: agentsHttpsPort is the https half of that same
+# pair, and the console needs its own copy of idpHostBaseDomain and tlsEnabled
+# to build env-Thunder sign-in URLs. The console's tlsEnabled is --set-string
+# deliberately — the chart declares that one as a quoted string ("false") while
+# agentManagerService.config.tlsEnabled is a real bool. Since 1.0.0 ships a
+# values.schema.json that is no longer a nicety: the guide's own plain --set
+# fails validation with `got boolean, want string`.
 helm upgrade --install --server-side=false amp \
   "${CHART_BASE}/wso2-agent-manager" \
   --version "${VERSION}" \
@@ -222,7 +227,7 @@ helm upgrade --install --server-side=false amp \
   --set console.config.auth.signInRedirectURL="${CONSOLE_PUBLIC_URL}/login" \
   --set console.config.auth.signOutRedirectURL="${CONSOLE_PUBLIC_URL}/login" \
   --set console.config.apiBaseUrl="${API_PUBLIC_URL}" \
-  --set console.config.thunderHostBaseDomain="${BASE_DOMAIN}" \
+  --set console.config.idpHostBaseDomain="${BASE_DOMAIN}" \
   --set-string console.config.tlsEnabled=true \
   --set agentManagerService.config.amObserverPublicURL="${OBS_API_PUBLIC_URL}" \
   --set console.ocIngress.hostname="${CONSOLE_PUBLIC_HOST}" \
@@ -235,11 +240,11 @@ helm upgrade --install --server-side=false amp \
   --set agentManagerService.config.thunder.clientSecret="${AMP_SYSTEM_CLIENT_SECRET}" \
   --set agentManagerService.config.thunder.baseURL="${THUNDER_PUBLIC_URL}" \
   --set agentManagerService.config.thunder.resolveToHost="" \
-  --set agentManagerService.config.thunderHostBaseDomain="${BASE_DOMAIN}" \
+  --set agentManagerService.config.idpHostBaseDomain="${BASE_DOMAIN}" \
   --set agentManagerService.config.agentsBaseDomain="${AGENTS_DOMAIN}" \
   --set agentManagerService.config.gatewayBaseDomain="${AGENTS_DOMAIN}" \
-  --set agentManagerService.config.agentsHttpPort="80" \
-  --set agentManagerService.config.agentsHttpsPort="443" \
+  --set-string agentManagerService.config.agentsHttpPort="80" \
+  --set-string agentManagerService.config.agentsHttpsPort="443" \
   --set agentManagerService.config.openChoreo.baseURL="${OPENCHOREO_API_URL}" \
   --set agentManagerService.config.tlsEnabled=true \
   --set agentManagerService.replicaCount=1 \
